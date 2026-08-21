@@ -21,12 +21,67 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
-    name: Windows build + GitHub Release
-    runs-on: windows-latest
-    timeout-minutes: 60
+  prepare:
+    name: Recreate rolling GitHub Release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      - name: Delete previous vX.Y.Z / nightly
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          gh release delete "v${VERSION}" --cleanup-tag --yes || true
+          gh release delete nightly --cleanup-tag --yes || true
+
+  release:
+    name: ${{ matrix.name }}
+    needs: prepare
+    if: always() && (needs.prepare.result == 'success' || needs.prepare.result == 'skipped')
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            platform: windows-latest
+            args: ""
+            engine_arch: x64
+            rust_targets: ""
+          - name: Linux x64
+            platform: ubuntu-22.04
+            args: ""
+            engine_arch: x64
+            rust_targets: ""
+          - name: Linux arm64
+            platform: ubuntu-22.04-arm
+            args: ""
+            engine_arch: arm64
+            rust_targets: ""
+          - name: macOS Apple Silicon
+            platform: macos-latest
+            args: "--target aarch64-apple-darwin"
+            engine_arch: arm64
+            rust_targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+          - name: macOS Intel
+            platform: macos-latest
+            args: "--target x86_64-apple-darwin"
+            engine_arch: x64
+            rust_targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux Tauri deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils xz-utils
 
       - uses: pnpm/action-setup@v4
         with:
@@ -38,14 +93,22 @@ jobs:
           cache: pnpm
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
 
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: "./src-tauri -> target"
+          prefix-key: ${{ matrix.platform }}-${{ matrix.engine_arch }}-${{ matrix.args }}
 
-      - name: Fetch yt-dlp.exe + ffmpeg.exe
+      - name: Fetch engines (Windows)
+        if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/fetch-engines.ps1 -Force
+
+      - name: Fetch engines (Unix)
+        if: runner.os != 'Windows'
+        run: bash scripts/fetch-engines.sh --force --arch ${{ matrix.engine_arch }}
 
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
@@ -56,32 +119,33 @@ jobs:
       - name: Cargo test
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
-      - name: Recreate rolling GitHub Release
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: pwsh
-        run: |
-          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-          foreach ($tag in @("v$version", "nightly")) {
-            gh release delete $tag --cleanup-tag --yes
-          }
-          exit 0
-
       - name: Build and publish
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           tauriScript: pnpm tauri
+          args: ${{ matrix.args }}
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v__VERSION__' }}
           releaseName: ${{ github.ref_type == 'tag' && format('yt-dlp GUI {0}', github.ref_name) || 'yt-dlp GUI v__VERSION__' }}
           releaseBody: |
-            Windows installer with bundled **yt-dlp** and **ffmpeg** (fetched at build time).
-            安装包已内置 yt-dlp 与 ffmpeg，安装后即可使用。
+            Installers with bundled **yt-dlp** and **ffmpeg** (fetched at build time).
+            安装包已内置 yt-dlp 与 ffmpeg。
 
-            Recommended: `yt-dlp.GUI_*_x64-setup.exe` (NSIS). MSI is also attached.
-            推荐下载 NSIS 安装包 `*-setup.exe`。
+            | Platform | File |
+            |---|---|
+            | Windows | `yt-dlp.GUI_*_x64-setup.exe` (NSIS) or `.msi` |
+            | Linux | `.AppImage` or `.deb` |
+            | macOS | `.dmg` (Apple Silicon and Intel) |
+
+            macOS builds are unsigned unless Apple signing secrets are configured. Gatekeeper: right-click → Open.
+            未签名的 macOS 安装包需右键打开。Linux AppImage 先 `chmod +x`。
           releaseDraft: false
           prerelease: false
           generateReleaseNotes: true

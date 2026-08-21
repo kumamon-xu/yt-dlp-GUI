@@ -6,9 +6,9 @@
 
 A desktop frontend for [yt-dlp](https://github.com/yt-dlp/yt-dlp). Paste a link, pick a quality, download. Built with **Tauri 2 + React + TypeScript**.
 
-Windows-first. Defaults to Chinese UI (English available). Optimized for Bilibili, YouTube, Douyin / TikTok, and the 1000+ sites yt-dlp already supports.
+Windows, Linux, and macOS. Defaults to Chinese UI (English available). Optimized for Bilibili, YouTube, Douyin / TikTok, and the 1000+ sites yt-dlp already supports.
 
-基于 yt-dlp 的图形化下载器：粘贴链接 → 选清晰度 → 下载。默认中文界面，可切换 English。
+基于 yt-dlp 的图形化下载器：粘贴链接 → 选清晰度 → 下载。支持 Windows / Linux / macOS。默认中文界面，可切换 English。
 
 **Download:** [latest installer](https://github.com/kumamon-xu/yt-dlp-GUI/releases/latest)
 
@@ -22,7 +22,7 @@ Windows-first. Defaults to Chinese UI (English available). Optimized for Bilibil
 - **Options** — presets (MP4 by default), cookies (browser or Netscape file), HTTP/SOCKS proxy, rate limit, subtitles, SponsorBlock. Live **command preview** you can copy.
 - **Toolbox** — subtitles only, thumbnail only, metadata JSON (same download pipeline).
 - **Quick download** — skip preview, use the saved default preset (factory: MP4).
-- **Engines in-tree** — `code/yt-dlp.exe` + `code/ffmpeg.exe`. The app does **not** assume ffmpeg is on `PATH`.
+- **Engines in-tree** — `code/yt-dlp` (+ `.exe` on Windows) and `ffmpeg`. The app does **not** assume ffmpeg is on `PATH`.
 
 ---
 
@@ -34,25 +34,33 @@ Run `pnpm tauri dev` and capture a window shot if you want one here (`docs/scree
 
 ## Requirements
 
-### End users (Windows)
+### End users
 
-- Windows 10/11 with WebView2 (usually already installed)
-- Install from [Releases](https://github.com/kumamon-xu/yt-dlp-GUI/releases/latest): `yt-dlp.GUI_*_x64-setup.exe` (recommended) or the `.msi`
-- yt-dlp and ffmpeg are **bundled** in the installer — you do not need to download them yourself
+Install from [Releases](https://github.com/kumamon-xu/yt-dlp-GUI/releases/latest). yt-dlp and ffmpeg are **bundled**.
+
+| OS | File | Notes |
+|---|---|---|
+| Windows 10/11 | `yt-dlp.GUI_*_x64-setup.exe` (or `.msi`) | WebView2 is usually already installed |
+| Linux x64 / arm64 | `.AppImage` or `.deb` | AppImage: `chmod +x` then run. deb needs WebKitGTK 4.1 |
+| macOS | `.dmg` (Apple Silicon and Intel) | Unsigned: right-click the app → Open (Gatekeeper) |
 
 YouTube playlist / channel pages may also need **Deno** or **Node** on `PATH` (yt-dlp 2026+ JS runtime).
 
 ### Developers
 
 - [Node.js](https://nodejs.org/) 20+ and [pnpm](https://pnpm.io/)
-- [Rust](https://rustup.rs/) (stable) + Visual Studio C++ build tools
+- [Rust](https://rustup.rs/) (stable). Windows: Visual Studio C++ build tools. Linux: WebKitGTK 4.1 + `librsvg2-dev` + `patchelf`
 - Engines in `code/` (not committed):
 
 ```powershell
+# Windows
 powershell -File scripts/fetch-engines.ps1
 ```
 
-Or drop in `code/yt-dlp.exe` ([releases](https://github.com/yt-dlp/yt-dlp/releases)) and `code/ffmpeg.exe` ([gyan.dev essentials](https://www.gyan.dev/ffmpeg/builds/)).
+```bash
+# Linux / macOS
+bash scripts/fetch-engines.sh
+```
 
 ---
 
@@ -60,7 +68,8 @@ Or drop in `code/yt-dlp.exe` ([releases](https://github.com/yt-dlp/yt-dlp/releas
 
 ```bash
 pnpm install
-powershell -File scripts/fetch-engines.ps1   # code/yt-dlp.exe + code/ffmpeg.exe
+# Windows: powershell -File scripts/fetch-engines.ps1
+# Linux / macOS: bash scripts/fetch-engines.sh
 pnpm tauri dev
 ```
 
@@ -73,7 +82,7 @@ pnpm exec tsc --noEmit
 pnpm tauri build
 ```
 
-The packaged app copies `code/yt-dlp.exe` and `code/ffmpeg.exe` as bundle resources. A machine without ffmpeg on `PATH` still works as long as those files were present at build time.
+The packaged app copies `code/yt-dlp` and `code/ffmpeg` as bundle resources. A machine without ffmpeg on `PATH` still works as long as those files were present at build time.
 
 ---
 
@@ -82,9 +91,9 @@ The packaged app copies `code/yt-dlp.exe` and `code/ffmpeg.exe` as bundle resour
 | Workflow | Trigger | What it does |
 |---|---|---|
 | [CI](.github/workflows/ci.yml) | PR and `main` | `tsc --noEmit` + `cargo test` |
-| [Release](.github/workflows/release.yml) | `main`, tag `v*`, or manual | Windows NSIS/MSI → GitHub Release |
+| [Release](.github/workflows/release.yml) | `main`, tag `v*`, or manual | Windows + Linux (x64/arm64) + macOS (arm64/x64) → one GitHub Release |
 
-- Push to `main` publishes **[Latest](https://github.com/kumamon-xu/yt-dlp-GUI/releases/latest)** as `vX.Y.Z` from `src-tauri/tauri.conf.json` (rebuilt installers).
+- Push to `main` publishes **[Latest](https://github.com/kumamon-xu/yt-dlp-GUI/releases/latest)** as `vX.Y.Z` from `src-tauri/tauri.conf.json`.
 - Tag `v*` (or **Actions → Release → Run workflow**) to pin that commit as a versioned release.
 
 ```bash
@@ -93,7 +102,7 @@ git tag v0.2.0
 git push origin v0.2.0
 ```
 
-CI downloads the latest yt-dlp + ffmpeg into `code/` before `tauri build`. Installers are unsigned (Windows SmartScreen may warn).
+CI downloads platform-native yt-dlp + ffmpeg into `code/` before `tauri build`. Installers are unsigned by default (Windows SmartScreen / macOS Gatekeeper may warn). Optional `APPLE_*` repo secrets enable macOS signing/notarization.
 
 ---
 
@@ -115,7 +124,7 @@ CI downloads the latest yt-dlp + ffmpeg into `code/` before `tauri build`. Insta
 ## Project layout
 
 ```
-code/                 # yt-dlp.exe + ffmpeg.exe (local, gitignored)
+code/                 # yt-dlp + ffmpeg (local, gitignored)
 src/                  # React UI
 src-tauri/src/        # Rust: process pool, arg builder, queue
   command.rs          # pure yt-dlp argv builder

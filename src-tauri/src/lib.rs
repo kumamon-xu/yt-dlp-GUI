@@ -8,11 +8,17 @@ mod tasks;
 
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use tauri::Manager;
 use tokio::process::Command;
 
 pub use config::GlobalSettings;
+
+static RESOURCE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+pub(crate) fn set_resource_dir(dir: PathBuf) {
+    let _ = RESOURCE_DIR.set(dir);
+}
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -23,6 +29,13 @@ fn no_window(cmd: &mut Command) {
 }
 #[cfg(not(windows))]
 pub(crate) fn no_window(_cmd: &mut Command) {}
+
+#[cfg(unix)]
+fn unix_process_group(cmd: &mut Command) {
+    cmd.process_group(0);
+}
+#[cfg(not(unix))]
+fn unix_process_group(_cmd: &mut Command) {}
 
 #[cfg(windows)]
 fn no_window_std(cmd: &mut std::process::Command) {
@@ -48,34 +61,64 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         let p = dir.join(name);
-        if p.is_file() {
+        if is_tool_file(&p) {
             return Some(p);
         }
     }
     None
 }
 
-/// CWD/code → exe 旁/code → exe 同级 → resources → PATH
+fn is_tool_file(p: &Path) -> bool {
+    if !p.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = p.metadata() {
+            if meta.permissions().mode() & 0o111 == 0 {
+                let mut perms = meta.permissions();
+                perms.set_mode(perms.mode() | 0o755);
+                let _ = std::fs::set_permissions(p, perms);
+            }
+        }
+    }
+    true
+}
+
+fn push_dir_tools(candidates: &mut Vec<PathBuf>, dir: &Path, name: &str) {
+    candidates.push(dir.join(name));
+    candidates.push(dir.join("code").join(name));
+}
+
+/// resource_dir → CWD/code → exe 旁 → Contents/Resources (macOS) → PATH
 pub(crate) fn find_tool(base: &str) -> Option<PathBuf> {
     let name = bin_name(base);
     let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = RESOURCE_DIR.get() {
+        push_dir_tools(&mut candidates, dir, &name);
+    }
     if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("code").join(&name));
+        push_dir_tools(&mut candidates, &cwd, &name);
         candidates.push(cwd.join("..").join("code").join(&name));
         candidates.push(cwd.join(&name));
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("code").join(&name));
-            candidates.push(dir.join(&name));
+            push_dir_tools(&mut candidates, dir, &name);
             candidates.push(dir.join("..").join("code").join(&name));
             candidates.push(dir.join("resources").join("code").join(&name));
             candidates.push(dir.join("resources").join(&name));
+            #[cfg(target_os = "macos")]
+            {
+                let resources = dir.join("..").join("Resources");
+                push_dir_tools(&mut candidates, &resources, &name);
+            }
         }
     }
     for c in candidates {
         let p = c.canonicalize().unwrap_or(c);
-        if p.is_file() {
+        if is_tool_file(&p) {
             return Some(p);
         }
     }
@@ -110,17 +153,23 @@ pub(crate) fn js_runtime_arg() -> Option<String> {
 }
 
 pub(crate) fn kill_process_tree(pid: u32) {
+    if pid == 0 {
+        return;
+    }
     #[cfg(windows)]
     {
         let mut cmd = std::process::Command::new("taskkill");
         no_window_std(&mut cmd);
         let _ = cmd.args(["/F", "/T", "/PID", &pid.to_string()]).status();
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status();
+        // process_group(0) makes pid == pgid; negative kill targets the group (yt-dlp + ffmpeg).
+        let pg = -(pid as i32);
+        unsafe {
+            libc::kill(pg, libc::SIGTERM);
+            libc::kill(pg, libc::SIGKILL);
+        }
     }
 }
 
@@ -176,6 +225,7 @@ async fn probe(bin: &Path, extra_args: &[&str]) -> ToolStatus {
 pub(crate) fn no_window_cmd(bin: &Path) -> Command {
     let mut cmd = Command::new(bin);
     no_window(&mut cmd);
+    unix_process_group(&mut cmd);
     cmd.env("PYTHONUTF8", "1");
     cmd
 }
@@ -194,7 +244,7 @@ async fn check_engine(state: tauri::State<'_, AppState>) -> Result<ToolStatus, S
     let (eng, _) = overrides(&state);
     match find_engine(eng.as_deref()) {
         Some(p) => Ok(probe(&p, &["--version"]).await),
-        None => Err("未找到 yt-dlp 引擎：请在 code/ 目录放置 yt-dlp.exe，或在设置中指定路径".into()),
+        None => Err("未找到 yt-dlp 引擎：请在 code/ 目录放置 yt-dlp，或在设置中指定路径".into()),
     }
 }
 
@@ -203,7 +253,7 @@ async fn check_ffmpeg(state: tauri::State<'_, AppState>) -> Result<ToolStatus, S
     let (_, ff) = overrides(&state);
     match find_ffmpeg(ff.as_deref()) {
         Some(p) => Ok(probe(&p, &["-version"]).await),
-        None => Err("未找到 ffmpeg：请将 ffmpeg.exe 放到 code/ 目录".into()),
+        None => Err("未找到 ffmpeg：请将 ffmpeg 放到 code/ 目录".into()),
     }
 }
 
@@ -312,6 +362,9 @@ pub fn run() {
         })
         .manage(tasks::TaskManager::default())
         .setup(|app| {
+            if let Ok(dir) = app.path().resource_dir() {
+                set_resource_dir(dir);
+            }
             let s = config::load_from_disk(app.handle());
             if let Ok(mut g) = app.state::<AppState>().settings.lock() {
                 *g = s;
@@ -343,4 +396,28 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bin_name_matches_platform() {
+        #[cfg(windows)]
+        {
+            assert_eq!(bin_name("yt-dlp"), "yt-dlp.exe");
+            assert_eq!(bin_name("ffmpeg"), "ffmpeg.exe");
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(bin_name("yt-dlp"), "yt-dlp");
+            assert_eq!(bin_name("ffmpeg"), "ffmpeg");
+        }
+    }
+
+    #[test]
+    fn kill_process_tree_ignores_pid_zero() {
+        kill_process_tree(0);
+    }
 }

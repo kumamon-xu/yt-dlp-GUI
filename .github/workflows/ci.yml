@@ -52,6 +52,13 @@ jobs:
         with:
           workspaces: "./src-tauri -> target"
 
+      - name: Placeholder engines for tauri-build
+        run: |
+          mkdir -p code
+          : > code/yt-dlp
+          : > code/ffmpeg
+          chmod +x code/yt-dlp code/ffmpeg
+
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
 

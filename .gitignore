@@ -13,10 +13,8 @@ src-tauri/gen/schemas
 **/*.pdb
 
 # Bundled engines — download into code/ locally (see README)
-code/*.exe
-code/*.dll
-code/*.so
-code/*.dylib
+code/*
+!code/.gitkeep
 
 # Windows artifacts
 nul
