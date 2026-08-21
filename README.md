@@ -1,10 +1,16 @@
 # yt-dlp GUI
 
+[![CI](https://github.com/kumamon-xu/yt-dlp-GUI/actions/workflows/ci.yml/badge.svg)](https://github.com/kumamon-xu/yt-dlp-GUI/actions/workflows/ci.yml)
+[![Release](https://github.com/kumamon-xu/yt-dlp-GUI/actions/workflows/release.yml/badge.svg)](https://github.com/kumamon-xu/yt-dlp-GUI/actions/workflows/release.yml)
+[![GitHub release](https://img.shields.io/github/v/release/kumamon-xu/yt-dlp-GUI)](https://github.com/kumamon-xu/yt-dlp-GUI/releases/latest)
+
 A desktop frontend for [yt-dlp](https://github.com/yt-dlp/yt-dlp). Paste a link, pick a quality, download. Built with **Tauri 2 + React + TypeScript**.
 
 Windows-first. Defaults to Chinese UI (English available). Optimized for Bilibili, YouTube, Douyin / TikTok, and the 1000+ sites yt-dlp already supports.
 
 基于 yt-dlp 的图形化下载器：粘贴链接 → 选清晰度 → 下载。默认中文界面，可切换 English。
+
+**Download:** [latest installer](https://github.com/kumamon-xu/yt-dlp-GUI/releases/latest) · development builds: [nightly](https://github.com/kumamon-xu/yt-dlp-GUI/releases/tag/nightly)
 
 ---
 
@@ -31,12 +37,8 @@ Run `pnpm tauri dev` and capture a window shot if you want one here (`docs/scree
 ### End users (Windows)
 
 - Windows 10/11 with WebView2 (usually already installed)
-- Place these two files next to each other:
-
-| File | Where to get it |
-|---|---|
-| `code/yt-dlp.exe` | [yt-dlp releases](https://github.com/yt-dlp/yt-dlp/releases) (Windows x64) |
-| `code/ffmpeg.exe` | [gyan.dev ffmpeg essentials](https://www.gyan.dev/ffmpeg/builds/) (or any static `ffmpeg.exe`) |
+- Install from [Releases](https://github.com/kumamon-xu/yt-dlp-GUI/releases/latest): `yt-dlp GUI_*_x64-setup.exe` (recommended) or the `.msi`
+- yt-dlp and ffmpeg are **bundled** in the installer — you do not need to download them yourself
 
 YouTube playlist / channel pages may also need **Deno** or **Node** on `PATH` (yt-dlp 2026+ JS runtime).
 
@@ -44,7 +46,13 @@ YouTube playlist / channel pages may also need **Deno** or **Node** on `PATH` (y
 
 - [Node.js](https://nodejs.org/) 20+ and [pnpm](https://pnpm.io/)
 - [Rust](https://rustup.rs/) (stable) + Visual Studio C++ build tools
-- The two binaries above in `code/`
+- Engines in `code/` (not committed):
+
+```powershell
+powershell -File scripts/fetch-engines.ps1
+```
+
+Or drop in `code/yt-dlp.exe` ([releases](https://github.com/yt-dlp/yt-dlp/releases)) and `code/ffmpeg.exe` ([gyan.dev essentials](https://www.gyan.dev/ffmpeg/builds/)).
 
 ---
 
@@ -52,11 +60,7 @@ YouTube playlist / channel pages may also need **Deno** or **Node** on `PATH` (y
 
 ```bash
 pnpm install
-
-# put engines here (not committed)
-#   code/yt-dlp.exe
-#   code/ffmpeg.exe
-
+powershell -File scripts/fetch-engines.ps1   # code/yt-dlp.exe + code/ffmpeg.exe
 pnpm tauri dev
 ```
 
@@ -70,6 +74,26 @@ pnpm tauri build
 ```
 
 The packaged app copies `code/yt-dlp.exe` and `code/ffmpeg.exe` as bundle resources. A machine without ffmpeg on `PATH` still works as long as those files were present at build time.
+
+---
+
+## GitHub Actions / releasing
+
+| Workflow | Trigger | What it does |
+|---|---|---|
+| [CI](.github/workflows/ci.yml) | PR and `main` | `tsc --noEmit` + `cargo test` |
+| [Release](.github/workflows/release.yml) | `main`, tag `v*`, or manual | Windows NSIS/MSI → GitHub Release |
+
+- Push to `main` updates the **[nightly](https://github.com/kumamon-xu/yt-dlp-GUI/releases/tag/nightly)** pre-release (latest development build).
+- Tag a version (or **Actions → Release → Run workflow**) to publish a stable release that GitHub marks as Latest.
+
+```bash
+# bump version in package.json, src-tauri/Cargo.toml, src-tauri/tauri.conf.json
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+CI downloads the latest yt-dlp + ffmpeg into `code/` before `tauri build`. Installers are unsigned (Windows SmartScreen may warn).
 
 ---
 

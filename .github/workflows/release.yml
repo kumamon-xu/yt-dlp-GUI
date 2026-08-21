@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore:
+      - "**.md"
+      - ".gitignore"
+      - "LICENSE"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Windows build + GitHub Release
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Drop previous nightly release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: gh release delete nightly --cleanup-tag --yes || true
+
+      - name: Fetch yt-dlp.exe + ffmpeg.exe
+        shell: pwsh
+        run: ./scripts/fetch-engines.ps1 -Force
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm exec tsc --noEmit
+
+      - name: Cargo test
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build and publish
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tauriScript: pnpm tauri
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || (github.event_name == 'workflow_dispatch' && 'v__VERSION__' || 'nightly') }}
+          releaseName: ${{ github.ref_type == 'tag' && format('yt-dlp GUI {0}', github.ref_name) || (github.event_name == 'workflow_dispatch' && 'yt-dlp GUI v__VERSION__' || 'yt-dlp GUI nightly') }}
+          releaseBody: |
+            Windows installer with bundled **yt-dlp** and **ffmpeg** (fetched at build time).
+            安装包已内置 yt-dlp 与 ffmpeg，安装后即可使用。
+
+            Recommended: `yt-dlp GUI_*_x64-setup.exe` (NSIS). MSI is also attached.
+            推荐下载 NSIS 安装包 `*-setup.exe`。
+          releaseDraft: false
+          prerelease: ${{ github.ref_type != 'tag' && github.event_name != 'workflow_dispatch' }}
+          generateReleaseNotes: true
+          uploadUpdaterJson: false
+          uploadUpdaterSignatures: false
+          retryAttempts: 2
