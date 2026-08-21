@@ -2,6 +2,8 @@ import { useEffect } from "react";
 import { Download, Loader2, RotateCw } from "lucide-react";
 import { useAppStore } from "./store";
 import type { ToolStatus } from "./lib/ytdlp";
+import UrlInput from "./components/UrlInput";
+import PreviewCard from "./components/PreviewCard";
 
 function StatusChip({ label, status, checking }: { label: string; status: ToolStatus | null; checking: boolean }) {
   const state = checking || status === null ? "checking" : status.available ? "ok" : "err";
@@ -9,7 +11,9 @@ function StatusChip({ label, status, checking }: { label: string; status: ToolSt
     status?.version != null
       ? label === "ffmpeg"
         ? status.version.replace(/^ffmpeg version\s*/i, "")
-        : status.version
+        : label === "JS"
+          ? status.version.split(" ")[0]
+          : status.version
       : null;
   const tip = status?.error ?? status?.path ?? "";
   return (
@@ -35,7 +39,7 @@ function StatusChip({ label, status, checking }: { label: string; status: ToolSt
 }
 
 export default function App() {
-  const { engine, ffmpeg, checking, refresh } = useAppStore();
+  const { engine, ffmpeg, jsRuntime, checking, refresh } = useAppStore();
 
   useEffect(() => {
     void refresh();
@@ -56,6 +60,7 @@ export default function App() {
         <div className="flex items-center gap-2">
           <StatusChip label="引擎" status={engine} checking={checking} />
           <StatusChip label="ffmpeg" status={ffmpeg} checking={checking} />
+          <StatusChip label="JS" status={jsRuntime} checking={checking} />
           <button
             onClick={() => void refresh()}
             title="重新检测"
@@ -66,18 +71,17 @@ export default function App() {
         </div>
       </header>
 
-      <main className="flex flex-1 flex-col items-center justify-center gap-4 p-8">
-        <div className="max-w-md rounded-xl border border-dashed border-slate-700 bg-slate-900/40 p-8 text-center">
-          <p className="text-sm text-slate-400">M0 脚手架就绪 ✅</p>
-          <p className="mt-2 text-xs leading-relaxed text-slate-500">
-            顶部状态栏已检测 yt-dlp 引擎与 ffmpeg。
-            <br />
-            下一步（M1）：粘贴 URL 即时预览 —— 标题 / 封面 / 时长 / 清晰度选择。
-          </p>
+      <div className="border-b border-slate-800 px-5 py-4">
+        <UrlInput />
+      </div>
+
+      <main className="flex-1 overflow-y-auto p-5">
+        <div className="mx-auto max-w-3xl">
+          <PreviewCard />
         </div>
         {engine?.path && (
-          <p className="max-w-lg truncate text-[11px] text-slate-600" title={engine.path}>
-            引擎路径：{engine.path}
+          <p className="mx-auto mt-4 max-w-3xl truncate text-[11px] text-slate-700" title={engine.path}>
+            引擎：{engine.path}
           </p>
         )}
       </main>

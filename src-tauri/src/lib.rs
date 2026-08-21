@@ -1,7 +1,10 @@
 //! yt-dlp GUI — Rust 核心
-//! M0: 引擎( yt-dlp.exe )与 ffmpeg 检测
+//! M0: 引擎( yt-dlp.exe )与 ffmpeg 检测；M1: URL 元数据预览
 //!
 //! 协议与约定见仓库根目录 VIBE_CODING_开发文档.md 与 CLAUDE.md。
+
+mod errors;
+mod info;
 
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -16,13 +19,13 @@ fn no_window(cmd: &mut Command) {
     cmd.creation_flags(CREATE_NO_WINDOW);
 }
 #[cfg(not(windows))]
-fn no_window(_cmd: &mut Command) {}
+pub(crate) fn no_window(_cmd: &mut Command) {}
 
 // ---------------------------------------------------------------- 引擎定位
 
 /// 按优先级查找 yt-dlp 可执行文件：
 /// CWD/code → CWD/../code → exe 同级/code → exe 上级/code → PATH
-fn find_engine() -> Option<PathBuf> {
+pub(crate) fn find_engine() -> Option<PathBuf> {
     let candidates: Vec<PathBuf> = {
         let mut v = Vec::new();
         if let Ok(cwd) = std::env::current_dir() {
@@ -101,7 +104,7 @@ async fn probe(bin: &Path, extra_args: &[&str]) -> ToolStatus {
     }
 }
 
-fn no_window_cmd(bin: &Path) -> Command {
+pub(crate) fn no_window_cmd(bin: &Path) -> Command {
     let mut cmd = Command::new(bin);
     no_window(&mut cmd);
     // UTF-8 输出（Windows GBK 控制台会搞坏中文标题）
@@ -146,6 +149,40 @@ async fn which_on_path(name: &str) -> Result<Option<PathBuf>, String> {
     Ok(first.map(|s| PathBuf::from(s)))
 }
 
+/// 检测 JS 运行时（yt-dlp 2026+ 解析 YouTube 需要 deno/node）
+#[tauri::command]
+async fn check_js_runtime() -> ToolStatus {
+    let (deno_name, node_name) = if cfg!(windows) {
+        ("deno.exe", "node.exe")
+    } else {
+        ("deno", "node")
+    };
+    // where/which 查找
+    let find = |name: &str| -> Option<PathBuf> {
+        let out = std::process::Command::new(if cfg!(windows) { "where" } else { "which" })
+            .arg(name)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        stdout.lines().next().map(str::trim).filter(|s| !s.is_empty()).map(PathBuf::from)
+    };
+    if let Some(p) = find(deno_name) {
+        return probe(&p, &["--version"]).await;
+    }
+    if let Some(p) = find(node_name) {
+        return probe(&p, &["--version"]).await;
+    }
+    ToolStatus {
+        available: false,
+        path: None,
+        version: None,
+        error: Some("未找到 JS 运行时（deno/node）：YouTube 播放列表/频道页解析需要，推荐安装 deno 或 node".into()),
+    }
+}
+
 /// 引擎可执行文件路径（供设置页展示）
 #[tauri::command]
 fn engine_path() -> Option<String> {
@@ -156,7 +193,13 @@ fn engine_path() -> Option<String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![check_engine, check_ffmpeg, engine_path])
+        .invoke_handler(tauri::generate_handler![
+            check_engine,
+            check_ffmpeg,
+            check_js_runtime,
+            engine_path,
+            info::get_info
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

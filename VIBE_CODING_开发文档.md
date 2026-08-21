@@ -105,6 +105,14 @@ yt-dlp -U          # 引擎自更新（stable）
 yt-dlp --version   # 与 GitHub /releases/latest 对比提示
 ```
 
+### 2.9 JS 运行时（yt-dlp 2026+ 新依赖，实测踩坑 ⚠️）
+yt-dlp 2026 版起，解析 YouTube（尤其播放列表/频道页）需要 JS 运行时：
+- 默认只启用 **deno**；无 deno 时 YouTube 单视频可解析（带 WARNING），但 tab/播放列表**直接失败**。
+- 支持 `--js-runtimes RUNTIME[:PATH]`，优先级 deno > node > quickjs > bun。
+- 本项目策略：状态栏检测 deno/node；预览/下载时若无 deno 而有 node，自动追加
+  `--js-runtimes node:<path>`。注意：大 tab 页（频道 videos）用 node 解析很慢（90s 超时），
+  真实 playlist 通常正常。
+
 ---
 
 ## 3. 技术选型
