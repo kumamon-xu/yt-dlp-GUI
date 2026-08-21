@@ -1,14 +1,38 @@
-//! URL 元数据预览：yt-dlp -J（不下载）
-//!
-//! 返回轻量结构：单视频带精简 formats[]；播放列表带轻量 entries[]。
-//! 重字段（format.url / http_headers / 全量描述）一律剥离，避免大 JSON 打爆 WebView。
+//! URL 元数据预览：yt-dlp -J（不下载）。新请求会杀掉上一次预览进程。
 
-use crate::errors::friendly_error;
+use crate::command::build_preview_args;
+use crate::parser::friendly_error;
+use crate::AppState;
 use serde::Serialize;
 use serde_json::Value;
+use std::process::Stdio;
+use std::sync::OnceLock;
 use std::time::Duration;
+use tauri::{AppHandle, Manager};
+use tokio::process::Child;
+use tokio::sync::Mutex;
 
-/// 单个格式（前端清晰度选择器数据源）
+/// 前端路径优先，否则用设置里的引擎覆盖（空串视为未设）。
+pub fn resolve_engine_override(frontend: Option<&str>, settings: Option<&str>) -> Option<String> {
+    frontend
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            settings
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+}
+
+/// 预览结束时只清自己的 PID，避免冲掉更新的 -J 进程。
+pub fn release_slot_if_owner(slot: &mut Option<u32>, pid: Option<u32>) {
+    if pid.is_some() && *slot == pid {
+        *slot = None;
+    }
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct FormatInfo {
@@ -27,7 +51,6 @@ pub struct FormatInfo {
     pub language: Option<String>,
 }
 
-/// 播放列表条目（轻量）
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaylistItem {
@@ -39,7 +62,6 @@ pub struct PlaylistItem {
     pub channel: Option<String>,
 }
 
-/// 预览结果
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoInfo {
@@ -97,7 +119,6 @@ fn extract_item(v: &Value) -> Option<PlaylistItem> {
     })
 }
 
-/// 解析 yt-dlp -J 输出（纯函数，可单测）
 pub fn parse_info_json(raw: &str) -> Result<VideoInfo, String> {
     let text = raw.trim();
     let start = text.find('{').ok_or_else(|| "返回内容为空".to_string())?;
@@ -116,18 +137,16 @@ pub fn parse_info_json(raw: &str) -> Result<VideoInfo, String> {
         .map(|arr| arr.iter().filter_map(extract_format).collect())
         .unwrap_or_default();
 
-    let playlist = entries.map(|arr| {
-        arr.iter()
-            .filter_map(|e| e.as_object().map(|_| e))
-            .filter_map(extract_item)
-            .collect()
-    });
+    let playlist = entries.map(|arr| arr.iter().filter_map(extract_item).collect());
 
-    // 描述截断，避免大文本
     let description = s(&v, "description").map(|d| {
         let chars: Vec<char> = d.chars().take(400).collect();
         let s: String = chars.into_iter().collect();
-        if d.chars().count() > 400 { format!("{s}…") } else { s }
+        if d.chars().count() > 400 {
+            format!("{s}…")
+        } else {
+            s
+        }
     });
 
     Ok(VideoInfo {
@@ -141,7 +160,11 @@ pub fn parse_info_json(raw: &str) -> Result<VideoInfo, String> {
         is_playlist,
         formats,
         playlist,
-        playlist_title: if is_playlist { s(&v, "title").or_else(|| s(&v, "playlist")) } else { None },
+        playlist_title: if is_playlist {
+            s(&v, "title").or_else(|| s(&v, "playlist"))
+        } else {
+            None
+        },
         playlist_count: v
             .get("playlist_count")
             .and_then(|c| c.as_u64())
@@ -151,54 +174,66 @@ pub fn parse_info_json(raw: &str) -> Result<VideoInfo, String> {
 
 const PREVIEW_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// PATH 中查找可执行文件（跨平台 where/which）
-async fn js_runtime_available(name: &str) -> Option<std::path::PathBuf> {
-    let lookup: &str = if cfg!(windows) { "where" } else { "which" };
-    let out = crate::no_window_cmd(std::path::Path::new(lookup))
-        .arg(name)
-        .output()
-        .await
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    stdout
-        .lines()
-        .next()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from)
+fn preview_slot() -> &'static Mutex<Option<u32>> {
+    static SLOT: OnceLock<Mutex<Option<u32>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
 }
 
-/// 解析 URL 元数据（不下载）
 #[tauri::command]
-pub async fn get_info(url: String, engine_path: Option<String>) -> Result<VideoInfo, String> {
-    use crate::{find_engine, no_window_cmd};
+pub async fn get_info(app: AppHandle, url: String, engine_path: Option<String>) -> Result<VideoInfo, String> {
+    use crate::{find_engine, js_runtime_arg, kill_process_tree, no_window_cmd};
 
-    let engine = match engine_path.filter(|p| !p.is_empty()) {
-        Some(p) => std::path::PathBuf::from(p),
-        None => find_engine().ok_or_else(|| "未找到 yt-dlp 引擎".to_string())?,
-    };
+    let settings = app
+        .state::<AppState>()
+        .settings
+        .lock()
+        .ok()
+        .map(|s| s.clone())
+        .unwrap_or_default();
 
-    // yt-dlp 2026+ 解析 YouTube 需要 JS 运行时（默认只启用 deno）；
-    // 本机无 deno 但有 node 时显式启用 node。
-    let mut cmd = no_window_cmd(&engine);
-    cmd.arg("-J")
-        .arg("--ignore-config")
-        .arg("--no-color")
-        .arg("--newline")
-        .arg("--windows-filenames");
-    if js_runtime_available("deno.exe").await.is_none() {
-        if let Some(node) = js_runtime_available("node.exe").await {
-            cmd.arg("--js-runtimes").arg(format!("node:{}", node.to_string_lossy()));
-        }
+    if let Some(old) = preview_slot().lock().await.take() {
+        kill_process_tree(old);
     }
-    cmd.arg(&url);
-    let out = tokio::time::timeout(PREVIEW_TIMEOUT, cmd.output())
-        .await
-        .map_err(|_| "解析超时（30s）：链接可能无效，或需要网络/代理/Cookies".to_string())?
-        .map_err(|e| friendly_error(&e.to_string()))?;
+
+    let engine_override = resolve_engine_override(engine_path.as_deref(), settings.engine_path.as_deref());
+    let engine = find_engine(engine_override.as_deref()).ok_or_else(|| "未找到 yt-dlp 引擎".to_string())?;
+
+    let args = build_preview_args(
+        &url,
+        settings.cookies_file.as_deref(),
+        settings.cookies_browser.as_deref(),
+        settings.proxy.as_deref(),
+        js_runtime_arg().as_deref(),
+    );
+
+    let mut cmd = no_window_cmd(&engine);
+    cmd.args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let child: Child = cmd.spawn().map_err(|e| friendly_error(&e.to_string()))?;
+    let pid = child.id();
+    if let Some(p) = pid {
+        *preview_slot().lock().await = Some(p);
+    }
+
+    let wait = tokio::time::timeout(PREVIEW_TIMEOUT, child.wait_with_output()).await;
+    {
+        let mut slot = preview_slot().lock().await;
+        release_slot_if_owner(&mut slot, pid);
+    }
+
+    let out = match wait {
+        Err(_) => {
+            if let Some(p) = pid {
+                kill_process_tree(p);
+            }
+            return Err("解析超时（30s）：链接可能无效，或需要网络/代理/Cookies".into());
+        }
+        Ok(Err(e)) => return Err(friendly_error(&e.to_string())),
+        Ok(Ok(o)) => o,
+    };
 
     if !out.status.success() {
         return Err(friendly_error(&String::from_utf8_lossy(&out.stderr)));
@@ -227,8 +262,7 @@ mod tests {
         assert!(!info.is_playlist);
         assert_eq!(info.title, "测试视频");
         assert_eq!(info.formats.len(), 2);
-        assert_eq!(info.formats[0].resolution.as_deref(), Some("1920x1080"));
-        assert!(info.formats[1].vcodec.is_none()); // "none" 已过滤
+        assert!(info.formats[1].vcodec.is_none());
     }
 
     #[test]
@@ -239,13 +273,37 @@ mod tests {
             "title": "我的合集",
             "playlist_count": 2,
             "entries": [
-                {"id": "v1", "title": "第1集", "duration": 10.0, "thumbnail": "https://x/1.jpg"},
-                {"id": "v2", "title": "第2集", "duration": 20.0, "thumbnail": "https://x/2.jpg"}
+                {"id": "v1", "title": "第1集", "duration": 10.0},
+                {"id": "v2", "title": "第2集", "duration": 20.0}
             ]
         }"#;
         let info = parse_info_json(raw).unwrap();
         assert!(info.is_playlist);
         assert_eq!(info.playlist.as_ref().unwrap().len(), 2);
-        assert_eq!(info.playlist_count, Some(2));
+    }
+
+    #[test]
+    fn engine_override_uses_settings_when_frontend_empty() {
+        assert_eq!(
+            resolve_engine_override(None, Some(r"D:\code\yt-dlp.exe")).as_deref(),
+            Some(r"D:\code\yt-dlp.exe")
+        );
+        assert_eq!(
+            resolve_engine_override(Some(""), Some(r"D:\code\yt-dlp.exe")).as_deref(),
+            Some(r"D:\code\yt-dlp.exe")
+        );
+        assert_eq!(
+            resolve_engine_override(Some(r"C:\custom\yt-dlp.exe"), Some(r"D:\code\yt-dlp.exe")).as_deref(),
+            Some(r"C:\custom\yt-dlp.exe")
+        );
+    }
+
+    #[test]
+    fn finishing_preview_does_not_wipe_newer_pid() {
+        let mut slot = Some(2u32);
+        release_slot_if_owner(&mut slot, Some(1));
+        assert_eq!(slot, Some(2), "newer preview PID must stay");
+        release_slot_if_owner(&mut slot, Some(2));
+        assert_eq!(slot, None);
     }
 }

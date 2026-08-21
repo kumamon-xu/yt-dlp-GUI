@@ -1,19 +1,22 @@
 //! yt-dlp GUI — Rust 核心
-//! M0: 引擎( yt-dlp.exe )与 ffmpeg 检测；M1: URL 元数据预览
-//!
-//! 协议与约定见仓库根目录 VIBE_CODING_开发文档.md 与 CLAUDE.md。
 
-mod errors;
+mod command;
+mod config;
 mod info;
+mod parser;
+mod tasks;
 
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use tauri::Manager;
 use tokio::process::Command;
+
+pub use config::GlobalSettings;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// Windows 下 spawn 子进程不闪黑框（所有 spawn 必须走这里）
 #[cfg(windows)]
 fn no_window(cmd: &mut Command) {
     cmd.creation_flags(CREATE_NO_WINDOW);
@@ -21,27 +24,30 @@ fn no_window(cmd: &mut Command) {
 #[cfg(not(windows))]
 pub(crate) fn no_window(_cmd: &mut Command) {}
 
-// ---------------------------------------------------------------- 引擎定位
+#[cfg(windows)]
+fn no_window_std(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+#[cfg(not(windows))]
+fn no_window_std(_cmd: &mut std::process::Command) {}
 
-/// 按优先级查找 yt-dlp 可执行文件：
-/// CWD/code → CWD/../code → exe 同级/code → exe 上级/code → PATH
-pub(crate) fn find_engine() -> Option<PathBuf> {
-    let candidates: Vec<PathBuf> = {
-        let mut v = Vec::new();
-        if let Ok(cwd) = std::env::current_dir() {
-            v.push(cwd.join("code").join(engine_bin_name()));
-            v.push(cwd.join("..").join("code").join(engine_bin_name()));
-        }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                v.push(dir.join("code").join(engine_bin_name()));
-                v.push(dir.join("..").join("code").join(engine_bin_name()));
-            }
-        }
-        v
-    };
-    for c in candidates {
-        let p = c.canonicalize().unwrap_or(c);
+pub struct AppState {
+    pub settings: Mutex<GlobalSettings>,
+}
+
+fn bin_name(base: &str) -> String {
+    if cfg!(windows) && !base.ends_with(".exe") {
+        format!("{base}.exe")
+    } else {
+        base.to_string()
+    }
+}
+
+fn which_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let p = dir.join(name);
         if p.is_file() {
             return Some(p);
         }
@@ -49,14 +55,74 @@ pub(crate) fn find_engine() -> Option<PathBuf> {
     None
 }
 
-fn engine_bin_name() -> &'static str {
-    #[cfg(windows)]
-    { "yt-dlp.exe" }
-    #[cfg(not(windows))]
-    { "yt-dlp" }
+/// CWD/code → exe 旁/code → exe 同级 → resources → PATH
+pub(crate) fn find_tool(base: &str) -> Option<PathBuf> {
+    let name = bin_name(base);
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("code").join(&name));
+        candidates.push(cwd.join("..").join("code").join(&name));
+        candidates.push(cwd.join(&name));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("code").join(&name));
+            candidates.push(dir.join(&name));
+            candidates.push(dir.join("..").join("code").join(&name));
+            candidates.push(dir.join("resources").join("code").join(&name));
+            candidates.push(dir.join("resources").join(&name));
+        }
+    }
+    for c in candidates {
+        let p = c.canonicalize().unwrap_or(c);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    which_on_path(&name)
 }
 
-// ---------------------------------------------------------------- 状态结构
+pub(crate) fn find_engine(override_path: Option<&str>) -> Option<PathBuf> {
+    if let Some(p) = override_path.map(str::trim).filter(|s| !s.is_empty()) {
+        let pb = PathBuf::from(p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+    find_tool("yt-dlp")
+}
+
+pub(crate) fn find_ffmpeg(override_path: Option<&str>) -> Option<PathBuf> {
+    if let Some(p) = override_path.map(str::trim).filter(|s| !s.is_empty()) {
+        let pb = PathBuf::from(p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+    find_tool("ffmpeg")
+}
+
+pub(crate) fn js_runtime_arg() -> Option<String> {
+    if which_on_path(&bin_name("deno")).is_some() {
+        return None;
+    }
+    which_on_path(&bin_name("node")).map(|p| format!("node:{}", p.to_string_lossy()))
+}
+
+pub(crate) fn kill_process_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let mut cmd = std::process::Command::new("taskkill");
+        no_window_std(&mut cmd);
+        let _ = cmd.args(["/F", "/T", "/PID", &pid.to_string()]).status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+    }
+}
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -67,7 +133,6 @@ pub struct ToolStatus {
     pub error: Option<String>,
 }
 
-/// 运行 `<bin> --version`（或自定义参数），取 stdout 首行作为版本号
 async fn probe(bin: &Path, extra_args: &[&str]) -> ToolStatus {
     let bin_str = bin.to_string_lossy().to_string();
     let out = match no_window_cmd(bin).args(extra_args).output().await {
@@ -82,7 +147,11 @@ async fn probe(bin: &Path, extra_args: &[&str]) -> ToolStatus {
         }
     };
     if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr).lines().next().unwrap_or("unknown error").to_string();
+        let err = String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .next()
+            .unwrap_or("unknown error")
+            .to_string();
         return ToolStatus {
             available: false,
             path: Some(bin_str),
@@ -107,98 +176,170 @@ async fn probe(bin: &Path, extra_args: &[&str]) -> ToolStatus {
 pub(crate) fn no_window_cmd(bin: &Path) -> Command {
     let mut cmd = Command::new(bin);
     no_window(&mut cmd);
-    // UTF-8 输出（Windows GBK 控制台会搞坏中文标题）
     cmd.env("PYTHONUTF8", "1");
     cmd
 }
 
-// ---------------------------------------------------------------- 命令
+fn overrides(state: &AppState) -> (Option<String>, Option<String>) {
+    state
+        .settings
+        .lock()
+        .ok()
+        .map(|s| (s.engine_path.clone(), s.ffmpeg_path.clone()))
+        .unwrap_or((None, None))
+}
 
-/// 检测 yt-dlp 引擎
 #[tauri::command]
-async fn check_engine() -> Result<ToolStatus, String> {
-    match find_engine() {
+async fn check_engine(state: tauri::State<'_, AppState>) -> Result<ToolStatus, String> {
+    let (eng, _) = overrides(&state);
+    match find_engine(eng.as_deref()) {
         Some(p) => Ok(probe(&p, &["--version"]).await),
         None => Err("未找到 yt-dlp 引擎：请在 code/ 目录放置 yt-dlp.exe，或在设置中指定路径".into()),
     }
 }
 
-/// 检测 ffmpeg（PATH 查找）
 #[tauri::command]
-async fn check_ffmpeg() -> Result<ToolStatus, String> {
-    // Windows 上 where 查找
-    let found = which_on_path("ffmpeg").await?;
-    match found {
+async fn check_ffmpeg(state: tauri::State<'_, AppState>) -> Result<ToolStatus, String> {
+    let (_, ff) = overrides(&state);
+    match find_ffmpeg(ff.as_deref()) {
         Some(p) => Ok(probe(&p, &["-version"]).await),
-        None => Err("未在 PATH 中找到 ffmpeg：合并视频/提取音频需要 ffmpeg（https://www.gyan.dev/ffmpeg/builds/）".into()),
+        None => Err("未找到 ffmpeg：请将 ffmpeg.exe 放到 code/ 目录".into()),
     }
 }
 
-async fn which_on_path(name: &str) -> Result<Option<PathBuf>, String> {
-    let lookup: &str = if cfg!(windows) { "where" } else { "which" };
-    let out = no_window_cmd(Path::new(lookup))
-        .arg(name)
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Ok(None);
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let first = stdout.lines().next().map(str::trim).filter(|s| !s.is_empty());
-    Ok(first.map(|s| PathBuf::from(s)))
-}
-
-/// 检测 JS 运行时（yt-dlp 2026+ 解析 YouTube 需要 deno/node）
 #[tauri::command]
 async fn check_js_runtime() -> ToolStatus {
-    let (deno_name, node_name) = if cfg!(windows) {
-        ("deno.exe", "node.exe")
-    } else {
-        ("deno", "node")
-    };
-    // where/which 查找
-    let find = |name: &str| -> Option<PathBuf> {
-        let out = std::process::Command::new(if cfg!(windows) { "where" } else { "which" })
-            .arg(name)
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        stdout.lines().next().map(str::trim).filter(|s| !s.is_empty()).map(PathBuf::from)
-    };
-    if let Some(p) = find(deno_name) {
+    if let Some(p) = which_on_path(&bin_name("deno")) {
         return probe(&p, &["--version"]).await;
     }
-    if let Some(p) = find(node_name) {
+    if let Some(p) = which_on_path(&bin_name("node")) {
         return probe(&p, &["--version"]).await;
     }
     ToolStatus {
         available: false,
         path: None,
         version: None,
-        error: Some("未找到 JS 运行时（deno/node）：YouTube 播放列表/频道页解析需要，推荐安装 deno 或 node".into()),
+        error: Some("未找到 JS 运行时（deno/node）：YouTube 播放列表/频道页解析需要".into()),
     }
 }
 
-/// 引擎可执行文件路径（供设置页展示）
 #[tauri::command]
-fn engine_path() -> Option<String> {
-    find_engine().map(|p| p.to_string_lossy().to_string())
+fn engine_path(state: tauri::State<'_, AppState>) -> Option<String> {
+    let (eng, _) = overrides(&state);
+    find_engine(eng.as_deref()).map(|p| p.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn ffmpeg_path(state: tauri::State<'_, AppState>) -> Option<String> {
+    let (_, ff) = overrides(&state);
+    find_ffmpeg(ff.as_deref()).map(|p| p.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn build_command(state: tauri::State<'_, AppState>, task: command::NewTask) -> Result<String, String> {
+    let (eng, ff) = overrides(&state);
+    let engine = find_engine(eng.as_deref()).ok_or_else(|| "未找到 yt-dlp 引擎".to_string())?;
+    let mut cfg = task.to_config();
+    cfg.ffmpeg_location = find_ffmpeg(ff.as_deref()).map(|p| p.to_string_lossy().into());
+    cfg.js_runtime = js_runtime_arg();
+    let args = command::build_args(&cfg);
+    Ok(command::format_command(&engine.to_string_lossy(), &args))
+}
+
+#[tauri::command]
+async fn update_engine(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let (eng, _) = overrides(&state);
+    let engine = find_engine(eng.as_deref()).ok_or_else(|| "未找到 yt-dlp 引擎".to_string())?;
+    let out = no_window_cmd(&engine)
+        .arg("-U")
+        .output()
+        .await
+        .map_err(|e| e.to_string())?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    Ok(format!("{stdout}{stderr}").trim().to_string())
+}
+
+fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
+
+    let show = MenuItem::with_id(app, "show", "显示", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let icon = app
+        .default_window_icon()
+        .cloned()
+        .ok_or("no window icon")?;
+    TrayIconBuilder::new()
+        .icon(icon)
+        .menu(&menu)
+        .tooltip("yt-dlp GUI")
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                    let _ = w.unminimize();
+                }
+            }
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } = event
+            {
+                if let Some(w) = tray.app_handle().get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+            }
+        })
+        .build(app)?;
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .manage(AppState {
+            settings: Mutex::new(GlobalSettings::default()),
+        })
+        .manage(tasks::TaskManager::default())
+        .setup(|app| {
+            let s = config::load_from_disk(app.handle());
+            if let Ok(mut g) = app.state::<AppState>().settings.lock() {
+                *g = s;
+            }
+            tasks::restore_queue(app.handle());
+            let _ = setup_tray(app);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             check_engine,
             check_ffmpeg,
             check_js_runtime,
             engine_path,
-            info::get_info
+            ffmpeg_path,
+            build_command,
+            update_engine,
+            info::get_info,
+            tasks::start_task,
+            tasks::cancel_task,
+            tasks::remove_task,
+            tasks::pause_task,
+            tasks::resume_task,
+            tasks::list_tasks,
+            tasks::open_folder,
+            config::load_settings,
+            config::save_settings,
+            config::pick_dir,
+            config::pick_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

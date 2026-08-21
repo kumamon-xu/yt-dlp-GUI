@@ -2,26 +2,28 @@ import type { FormatInfo } from "./ytdlp";
 
 export interface FormatOption {
   formatId: string;
-  /** 主标签：1080p / 720p / 音频 m4a / 视频流 */
   label: string;
-  /** 副标签：mp4 · 30fps · HDR · 128.5 MB */
   sub: string[];
+  vcodec: string | null;
+  acodec: string | null;
+  resolution: string | null;
+  height: number;
 }
 
-/** 清晰度排序：视频按分辨率降序、文件大者优先；纯音频最后 */
+export function formatHeight(resolution: string | null): number {
+  const m = resolution?.match(/(\d+)x(\d+)/);
+  return m ? parseInt(m[2], 10) : 0;
+}
+
 export function formatOptions(formats: FormatInfo[]): FormatOption[] {
   const seen = new Set<string>();
   const uniq = formats.filter((f) => {
-    if (seen.has(f.formatId)) return false;
+    if (!f.formatId || seen.has(f.formatId)) return false;
     seen.add(f.formatId);
     return true;
   });
 
   const isAudioOnly = (f: FormatInfo) => !f.vcodec;
-  const height = (f: FormatInfo) => {
-    const m = f.resolution?.match(/(\d+)x(\d+)/);
-    return m ? parseInt(m[2], 10) : 0;
-  };
   const size = (f: FormatInfo) => f.filesize ?? f.filesizeApprox ?? 0;
 
   return uniq
@@ -29,24 +31,46 @@ export function formatOptions(formats: FormatInfo[]): FormatOption[] {
       const aa = isAudioOnly(a);
       const ba = isAudioOnly(b);
       if (aa !== ba) return aa ? 1 : -1;
-      const h = height(b) - height(a);
+      const h = formatHeight(b.resolution) - formatHeight(a.resolution);
       if (h !== 0) return h;
       return size(b) - size(a);
     })
-    .slice(0, 40)
+    .slice(0, 60)
     .map((f) => {
+      const height = formatHeight(f.resolution);
       const label = isAudioOnly(f)
         ? `音频 ${f.acodec ?? f.ext ?? ""}`
-        : f.resolution ?? "视频流";
+        : height > 0
+          ? `${height}p`
+          : "视频流";
       const sub: string[] = [];
+      if (f.vcodec) sub.push(f.vcodec);
+      if (f.acodec && !f.vcodec) sub.push(f.acodec);
       if (f.ext) sub.push(f.ext);
       if (f.fps) sub.push(`${Math.round(f.fps)}fps`);
       if (f.dynamicRange) sub.push(f.dynamicRange);
       const s = size(f);
       if (s > 0) sub.push(fmtSize(s));
       if (f.note) sub.push(f.note);
-      return { formatId: f.formatId, label, sub };
+      return {
+        formatId: f.formatId,
+        label,
+        sub,
+        vcodec: f.vcodec,
+        acodec: f.acodec,
+        resolution: f.resolution,
+        height,
+      };
     });
+}
+
+/** 仅视频补 +ba，避免无声文件 */
+export function customFormatFromSelection(o: FormatOption | null): { preset: string; customFormat?: string } {
+  if (!o) return { preset: "best" };
+  if (o.vcodec && !o.acodec) {
+    return { preset: "custom", customFormat: `${o.formatId}+ba/${o.formatId}/b` };
+  }
+  return { preset: "custom", customFormat: o.formatId };
 }
 
 export function fmtDuration(sec?: number | null): string {
@@ -58,7 +82,19 @@ export function fmtDuration(sec?: number | null): string {
   return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${ss}` : `${m}:${ss}`;
 }
 
-/** yt-dlp 的 filesize 单位为字节 */
+export function fmtSpeed(n: number | null | undefined): string {
+  if (n == null || !isFinite(n) || n <= 0) return "—";
+  const mb = n / 1024 / 1024;
+  return mb >= 1 ? `${mb.toFixed(1)} MB/s` : `${Math.round(n / 1024)} KB/s`;
+}
+
+export function fmtEta(sec: number | null | undefined): string {
+  if (sec == null || !isFinite(sec) || sec <= 0) return "—";
+  const s = Math.round(sec);
+  const m = Math.floor(s / 60);
+  return `${String(m).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+}
+
 export function fmtSize(bytes: number): string {
   const v = bytes;
   if (v >= 1024 ** 3) return `${(v / 1024 ** 3).toFixed(2)} GB`;
