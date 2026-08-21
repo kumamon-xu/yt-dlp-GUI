@@ -102,7 +102,7 @@ git tag v0.2.0
 git push origin v0.2.0
 ```
 
-CI downloads platform-native yt-dlp + ffmpeg into `code/` before `tauri build`. Installers are unsigned by default (Windows SmartScreen / macOS Gatekeeper may warn). Optional `APPLE_*` repo secrets enable macOS signing/notarization.
+CI downloads platform-native yt-dlp + ffmpeg into `code/` before `tauri build`. Installers are unsigned (Windows SmartScreen / macOS Gatekeeper may warn). To sign macOS builds, add `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, and related secrets to the repo, then pass them as `env` on the `tauri-action` step.
 
 ---
 

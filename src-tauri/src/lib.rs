@@ -43,6 +43,7 @@ fn no_window_std(cmd: &mut std::process::Command) {
     cmd.creation_flags(CREATE_NO_WINDOW);
 }
 #[cfg(not(windows))]
+#[allow(dead_code)]
 fn no_window_std(_cmd: &mut std::process::Command) {}
 
 pub struct AppState {
