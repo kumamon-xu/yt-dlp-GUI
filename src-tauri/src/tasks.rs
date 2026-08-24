@@ -17,6 +17,11 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_AFTER_GEN_DELAY_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -530,6 +535,14 @@ pub fn spawn_download_with(
         }
         gen
     };
+
+    #[cfg(test)]
+    {
+        let ms = TEST_AFTER_GEN_DELAY_MS.with(|c| c.get());
+        if ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
 
     let mut cmd = no_window_cmd(engine);
     cmd.args(&args)
@@ -1379,7 +1392,9 @@ fn main() {{
             watcher.canceled.store(true, Ordering::SeqCst);
             watcher.payload.lock().unwrap().status = TaskStatus::Canceled;
         });
+        TEST_AFTER_GEN_DELAY_MS.with(|c| c.set(80));
         let res = spawn_download_with(Arc::clone(&inner), &engine, None, None);
+        TEST_AFTER_GEN_DELAY_MS.with(|c| c.set(0));
         let _ = h.join();
         assert!(res.is_err(), "spawn must abort after cancel");
         assert_eq!(inner.payload.lock().unwrap().status, TaskStatus::Canceled);
@@ -1408,7 +1423,9 @@ fn main() {{
             }
             watcher.payload.lock().unwrap().status = TaskStatus::Paused;
         });
+        TEST_AFTER_GEN_DELAY_MS.with(|c| c.set(80));
         let res = spawn_download_with(Arc::clone(&inner), &engine, None, None);
+        TEST_AFTER_GEN_DELAY_MS.with(|c| c.set(0));
         let _ = h.join();
         assert!(res.is_err(), "spawn must abort after pause");
         assert_eq!(inner.payload.lock().unwrap().status, TaskStatus::Paused);
