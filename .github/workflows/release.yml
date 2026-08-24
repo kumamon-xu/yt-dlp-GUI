@@ -80,12 +80,18 @@ jobs:
           if gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft >release-state.txt 2>/dev/null; then
             existing=$(cat release-state.txt)
           fi
-          prune_stale_assets() {
+          clear_release_assets() {
             while IFS= read -r asset; do
-              if [ -n "$asset" ] && [ ! -f "publish/$asset" ]; then
+              if [ -n "$asset" ]; then
                 gh release delete-asset "$RELEASE_TAG" "$asset" --yes
               fi
             done < <(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')
+
+            remaining=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets | length')
+            if [ "$remaining" != "0" ]; then
+              echo "release assets were not fully cleared: $RELEASE_TAG" >&2
+              exit 1
+            fi
           }
 
           if [ "$IS_STABLE" = "true" ]; then
@@ -97,8 +103,8 @@ jobs:
               gh release create "$RELEASE_TAG" --draft --verify-tag --generate-notes \
                 --title "yt-dlp GUI $RELEASE_TAG"
             fi
-            gh release upload "$RELEASE_TAG" publish/* --clobber
-            prune_stale_assets
+            clear_release_assets
+            gh release upload "$RELEASE_TAG" publish/*
             gh release edit "$RELEASE_TAG" --draft=false --prerelease=false
           else
             if [ -z "$existing" ]; then
@@ -106,8 +112,8 @@ jobs:
                 --title "yt-dlp GUI nightly" \
                 --notes "Rolling main-branch build. Installers bundle yt-dlp and FFmpeg."
             fi
-            gh release upload nightly publish/* --clobber
-            prune_stale_assets
+            clear_release_assets
+            gh release upload nightly publish/*
             gh release edit nightly --draft=false --prerelease=true \
               --target "$GITHUB_SHA" --title "yt-dlp GUI nightly"
           fi
