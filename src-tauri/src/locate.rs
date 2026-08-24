@@ -252,7 +252,11 @@ mod tests {
         assert!(release.contains("needs: [verify-version, build]"));
         assert!(release.contains("prepare-release-assets.py"));
         assert!(release.contains("--draft=false"));
-        assert!(release.contains("gh release upload \"$RELEASE_TAG\" publish/* --clobber"));
+        assert!(release.contains("clear_release_assets"));
+        assert!(release.contains("gh release delete-asset \"$RELEASE_TAG\" \"$asset\" --yes"));
+        assert!(release.contains("release assets were not fully cleared"));
+        assert!(release.contains("gh release upload \"$RELEASE_TAG\" publish/*"));
+        assert!(!release.contains("publish/* --clobber"));
         assert!(reusable.contains("pnpm test"));
         assert!(reusable.contains("clippy"));
         assert!(reusable.contains("-Lock") && reusable.contains("--lock"));
