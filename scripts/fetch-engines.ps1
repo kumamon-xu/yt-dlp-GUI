@@ -42,14 +42,14 @@ function Assert-LicenseFile($ToolNode, [string]$ToolName) {
 $useLock = -not $Latest
 if ($Lock) { $useLock = $true }
 
-$lock = $null
+$engineLock = $null
 if ($useLock) {
     if (-not (Test-Path -LiteralPath $LockFile -PathType Leaf)) {
         throw "missing lock file: $LockFile"
     }
-    $lock = Get-Content $LockFile -Raw | ConvertFrom-Json
-    Assert-LicenseFile $lock.'yt-dlp' 'yt-dlp'
-    Assert-LicenseFile $lock.ffmpeg 'ffmpeg'
+    $engineLock = Get-Content $LockFile -Raw | ConvertFrom-Json
+    Assert-LicenseFile $engineLock.'yt-dlp' 'yt-dlp'
+    Assert-LicenseFile $engineLock.ffmpeg 'ffmpeg'
 }
 
 $Ytdlp = Join-Path $Code "yt-dlp.exe"
@@ -59,8 +59,8 @@ if (-not $Force -and (Test-Path $Ytdlp) -and (Test-Path $Ffmpeg)) {
     if ((Get-Item $Ytdlp).Length -gt 1MB -and (Get-Item $Ffmpeg).Length -gt 1MB) {
         $existingValid = $true
         if ($useLock) {
-            $existingValid = (Get-Sha256 $Ytdlp) -eq $lock.'yt-dlp'.'windows-x64'.sha256.ToLowerInvariant() -and
-                (Get-Sha256 $Ffmpeg) -eq $lock.ffmpeg.'windows-x64'.sha256.ToLowerInvariant()
+            $existingValid = (Get-Sha256 $Ytdlp) -eq $engineLock.'yt-dlp'.'windows-x64'.sha256.ToLowerInvariant() -and
+                (Get-Sha256 $Ffmpeg) -eq $engineLock.ffmpeg.'windows-x64'.sha256.ToLowerInvariant()
             if (-not $existingValid) { Write-Host "existing engines do not match lock; re-downloading" }
         }
         if ($existingValid) {
@@ -73,18 +73,23 @@ if (-not $Force -and (Test-Path $Ytdlp) -and (Test-Path $Ffmpeg)) {
 }
 
 if ($useLock) {
-    $yt = $lock.'yt-dlp'.'windows-x64'
+    $yt = $engineLock.'yt-dlp'.'windows-x64'
     Invoke-Download $yt.url $Ytdlp
     $got = Get-Sha256 $Ytdlp
     if ($got -ne $yt.sha256.ToLowerInvariant()) {
         throw "yt-dlp hash mismatch: expected $($yt.sha256) got $got"
     }
-    $ff = $lock.ffmpeg.'windows-x64'
+    $ff = $engineLock.ffmpeg.'windows-x64'
     $tmp = Join-Path ([IO.Path]::GetTempPath()) ("ff-" + [guid]::NewGuid().ToString("n"))
     New-Item -ItemType Directory -Force -Path $tmp | Out-Null
     try {
         $zip = Join-Path $tmp "ffmpeg.zip"
         Invoke-Download $ff.url $zip
+        if (-not $ff.archiveSha256) { throw "missing ffmpeg archiveSha256" }
+        $archiveGot = Get-Sha256 $zip
+        if ($archiveGot -ne $ff.archiveSha256.ToLowerInvariant()) {
+            throw "ffmpeg archive hash mismatch: expected $($ff.archiveSha256) got $archiveGot"
+        }
         Expand-Archive $zip (Join-Path $tmp "out") -Force
         $exe = Get-ChildItem -Path (Join-Path $tmp "out") -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
         if (-not $exe) { throw "ffmpeg.exe missing from archive" }

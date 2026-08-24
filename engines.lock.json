@@ -31,7 +31,8 @@
     "licenseSha256": "e57f1c320b8cf8798a7d2ff83a6f9e06a33a03585f6e065fea97f1d86db84052",
     "windows-x64": {
       "url": "https://github.com/GyanD/codexffmpeg/releases/download/9.0.1/ffmpeg-9.0.1-essentials_build.zip",
-      "sha256": "1a65d5b0b10d8d9a81d2824a3538046a40ed3607c906b335a166add87613f705",
+      "sha256": "72a489eccd008c2ec2c0a5856c5c75bc3d8bbfa90166c4566865c246445e6aa3",
+      "archiveSha256": "fec81ae03971d9dd4be3ebe02e263bd2ec1d789483f931bdba5f5715e65da2e9",
       "archive": "zip",
       "member": "ffmpeg.exe",
       "licenseNoticeUrl": "https://www.gyan.dev/ffmpeg/builds/",

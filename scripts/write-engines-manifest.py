@@ -44,6 +44,7 @@ def lock_metadata(lock: dict, tool: str, key: str) -> dict:
     node = tool_node.get(key) or {}
     return {
         "locked_sha256": node.get("sha256"),
+        "locked_archive_sha256": node.get("archiveSha256"),
         "license": node.get("license") or tool_node.get("license"),
         "license_file": node.get("licenseFile") or tool_node.get("licenseFile"),
         "license_url": node.get("licenseUrl") or tool_node.get("licenseUrl"),

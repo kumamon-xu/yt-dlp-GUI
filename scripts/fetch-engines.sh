@@ -142,11 +142,22 @@ if [[ "$MODE" == lock ]]; then
   FF_URL="$(lock_get ffmpeg "$ff_key" url)"
   FF_SHA="$(lock_get ffmpeg "$ff_key" sha256)"
   FF_ARCHIVE="$(lock_get ffmpeg "$ff_key" archive)"
+  FF_ARCHIVE_SHA="$(lock_get ffmpeg "$ff_key" archiveSha256)"
   FF_MEMBER="$(lock_get ffmpeg "$ff_key" member)"
   if [[ -n "$FF_ARCHIVE" ]]; then
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
     download "$FF_URL" "$tmp/archive.bin"
+    if [[ -z "$FF_ARCHIVE_SHA" ]]; then
+      echo "missing ffmpeg archiveSha256" >&2
+      exit 1
+    fi
+    got=$(sha256_of "$tmp/archive.bin")
+    exp=$(echo "$FF_ARCHIVE_SHA" | tr 'A-Z' 'a-z')
+    if [[ "$got" != "$exp" ]]; then
+      echo "ffmpeg archive hash mismatch: expected $exp got $got" >&2
+      exit 1
+    fi
     if [[ "$FF_ARCHIVE" == zip ]]; then
       unzip -o "$tmp/archive.bin" -d "$tmp/out" >/dev/null
     else
