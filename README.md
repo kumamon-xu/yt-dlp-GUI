@@ -77,6 +77,7 @@ pnpm tauri dev
 # tests
 cargo test --manifest-path src-tauri/Cargo.toml
 pnpm exec tsc --noEmit
+pnpm test
 
 # release installer / exe
 pnpm tauri build
@@ -90,11 +91,11 @@ The packaged app copies `code/yt-dlp` and `code/ffmpeg` as bundle resources. A m
 
 | Workflow | Trigger | What it does |
 |---|---|---|
-| [CI](.github/workflows/ci.yml) | PR and `main` | `tsc --noEmit` + `cargo test` |
+| [CI](.github/workflows/ci.yml) | PR and `main` | version check, `tsc`, `pnpm test`, `cargo fmt`, clippy, `cargo test` |
 | [Release](.github/workflows/release.yml) | `main`, tag `v*`, or manual | Windows + Linux (x64/arm64) + macOS (arm64/x64) → one GitHub Release |
 
-- Push to `main` publishes **[Latest](https://github.com/kumamon-xu/yt-dlp-GUI/releases/latest)** as `vX.Y.Z` from `src-tauri/tauri.conf.json`.
-- Tag `v*` (or **Actions → Release → Run workflow**) to pin that commit as a versioned release.
+- Push to `main` updates the **nightly** prerelease only. It never deletes or overwrites a `vX.Y.Z` stable release.
+- Tag `v*` to publish an immutable **stable** release (GitHub Latest). Engines are pinned in `engines.lock.json` (sha256).
 
 ```bash
 # bump version in package.json, src-tauri/Cargo.toml, src-tauri/tauri.conf.json

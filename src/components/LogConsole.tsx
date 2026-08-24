@@ -4,7 +4,9 @@ import { useAppStore, useT } from "../store";
 
 export default function LogConsole() {
   const [open, setOpen] = useState(false);
-  const logs = useAppStore((s) => s.logs);
+  const allLogs = useAppStore((s) => s.logs);
+  const selectedTaskId = useAppStore((s) => s.selectedTaskId);
+  const logs = selectedTaskId ? allLogs.filter((l) => l.id === selectedTaskId) : allLogs;
   const t = useT();
   const end = useRef<HTMLDivElement>(null);
 

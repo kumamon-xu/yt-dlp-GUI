@@ -22,24 +22,38 @@ env:
 
 jobs:
   prepare:
-    name: Recreate rolling GitHub Release
+    name: Recreate nightly only
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Delete previous vX.Y.Z / nightly
+      - name: Delete previous nightly (never delete vX.Y.Z)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release delete nightly --cleanup-tag --yes || true
+
+  verify-version:
+    name: Version consistency
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: package.json / Cargo.toml / tauri.conf.json
         run: |
-          VERSION=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
-          gh release delete "v${VERSION}" --cleanup-tag --yes || true
-          gh release delete nightly --cleanup-tag --yes || true
+          python3 - <<'PY'
+          import json,re,pathlib,sys
+          pkg=json.load(open("package.json"))["version"]
+          tauri=json.load(open("src-tauri/tauri.conf.json"))["version"]
+          cargo=re.search(r'^version = "([^"]+)"', pathlib.Path("src-tauri/Cargo.toml").read_text(), re.M).group(1)
+          print(pkg, cargo, tauri)
+          if not (pkg==cargo==tauri):
+              sys.exit("version mismatch")
+          PY
 
   release:
     name: ${{ matrix.name }}
-    needs: prepare
-    if: always() && (needs.prepare.result == 'success' || needs.prepare.result == 'skipped')
+    needs: [prepare, verify-version]
+    if: always() && needs.verify-version.result == 'success' && (needs.prepare.result == 'success' || needs.prepare.result == 'skipped')
     permissions:
       contents: write
     strategy:
@@ -104,11 +118,18 @@ jobs:
       - name: Fetch engines (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./scripts/fetch-engines.ps1 -Force
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") { ./scripts/fetch-engines.ps1 -Force -Lock }
+          else { ./scripts/fetch-engines.ps1 -Force -Latest }
 
       - name: Fetch engines (Unix)
         if: runner.os != 'Windows'
-        run: bash scripts/fetch-engines.sh --force --arch ${{ matrix.engine_arch }}
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            bash scripts/fetch-engines.sh --force --lock --arch ${{ matrix.engine_arch }}
+          else
+            bash scripts/fetch-engines.sh --force --latest --arch ${{ matrix.engine_arch }}
+          fi
 
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
@@ -119,29 +140,35 @@ jobs:
       - name: Cargo test
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
-      - name: Build and publish
+      - name: Build (for smoke)
+        run: pnpm tauri build ${{ matrix.args }}
+
+      - name: Smoke bundled engines (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/check-bundled-engines.ps1 -Root src-tauri/target
+
+      - name: Smoke bundled engines (Unix)
+        if: runner.os != 'Windows'
+        run: bash scripts/check-bundled-engines.sh src-tauri/target
+
+      - name: Publish
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tauriScript: pnpm tauri
           args: ${{ matrix.args }}
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v__VERSION__' }}
-          releaseName: ${{ github.ref_type == 'tag' && format('yt-dlp GUI {0}', github.ref_name) || 'yt-dlp GUI v__VERSION__' }}
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'nightly' }}
+          releaseName: ${{ github.ref_type == 'tag' && format('yt-dlp GUI {0}', github.ref_name) || 'yt-dlp GUI nightly' }}
           releaseBody: |
-            Installers with bundled **yt-dlp** and **ffmpeg** (fetched at build time).
+            Installers with bundled **yt-dlp** and **ffmpeg**.
             安装包已内置 yt-dlp 与 ffmpeg。
 
-            | Platform | File |
-            |---|---|
-            | Windows | `yt-dlp.GUI_*_x64-setup.exe` (NSIS) or `.msi` |
-            | Linux | `.AppImage` or `.deb` |
-            | macOS | `.dmg` (Apple Silicon and Intel) |
-
-            macOS builds are unsigned unless Apple signing secrets are configured. Gatekeeper: right-click → Open.
-            未签名的 macOS 安装包需右键打开。Linux AppImage 先 `chmod +x`。
+            Stable = git tag `v*`. Nightly = `main` (prerelease, rolling).
+            稳定版仅由版本 tag 产生，不会被后续 main 覆盖。
           releaseDraft: false
-          prerelease: false
+          prerelease: ${{ github.ref_type != 'tag' }}
           generateReleaseNotes: true
           uploadUpdaterJson: false
           uploadUpdaterSignatures: false

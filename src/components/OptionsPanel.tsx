@@ -61,6 +61,7 @@ export default function OptionsPanel() {
           <input
             type="number"
             min={1}
+            max={32}
             className={`${field} mt-1`}
             value={o.concurrentFragments}
             onChange={(e) => set({ concurrentFragments: Number(e.target.value) || 4 })}

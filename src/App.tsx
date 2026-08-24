@@ -40,6 +40,7 @@ function StatusChip({ label, status, checking }: { label: string; status: ToolSt
       )}
       <span>{label}</span>
       {version && <span className="max-w-[9rem] truncate font-mono">{version}</span>}
+      {status?.source && <span className="text-[10px] opacity-70">{status.source}</span>}
     </div>
   );
 }

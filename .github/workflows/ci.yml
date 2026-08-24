@@ -28,7 +28,7 @@ jobs:
   check:
     name: typecheck + tests
     runs-on: ubuntu-22.04
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -47,6 +47,8 @@ jobs:
           cache: pnpm
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - uses: swatinem/rust-cache@v2
         with:
@@ -59,11 +61,31 @@ jobs:
           : > code/ffmpeg
           chmod +x code/yt-dlp code/ffmpeg
 
+      - name: Version consistency
+        run: |
+          python3 - <<'PY'
+          import json,re,pathlib,sys
+          pkg=json.load(open("package.json"))["version"]
+          tauri=json.load(open("src-tauri/tauri.conf.json"))["version"]
+          cargo=re.search(r'^version = "([^"]+)"', pathlib.Path("src-tauri/Cargo.toml").read_text(), re.M).group(1)
+          if not (pkg==cargo==tauri):
+              sys.exit(f"mismatch {pkg} {cargo} {tauri}")
+          PY
+
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
 
       - name: Typecheck
         run: pnpm exec tsc --noEmit
+
+      - name: Frontend tests
+        run: pnpm test
+
+      - name: Cargo fmt
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: Cargo test
         run: cargo test --manifest-path src-tauri/Cargo.toml

@@ -96,15 +96,14 @@ pub fn load_from_disk(app: &AppHandle) -> GlobalSettings {
 }
 
 pub fn save_to_disk(app: &AppHandle, s: &GlobalSettings) -> Result<(), String> {
-    let p = settings_path(app);
-    let json = serde_json::to_string_pretty(s).map_err(|e| e.to_string())?;
-    std::fs::write(p, json).map_err(|e| e.to_string())
+    crate::validate::validate_settings(s)?;
+    crate::fsutil::atomic_write_json(&settings_path(app), s)
 }
 
 #[tauri::command]
 pub fn load_settings(app: AppHandle) -> GlobalSettings {
     let s = load_from_disk(&app);
-    if let Ok(mut g) = app.state::<crate::AppState>().settings.try_lock() {
+    if let Ok(mut g) = app.state::<crate::AppState>().settings.lock() {
         *g = s.clone();
     }
     s
@@ -112,11 +111,56 @@ pub fn load_settings(app: AppHandle) -> GlobalSettings {
 
 #[tauri::command]
 pub fn save_settings(app: AppHandle, settings: GlobalSettings) -> Result<(), String> {
+    crate::validate::validate_settings(&settings)?;
     save_to_disk(&app, &settings)?;
-    if let Ok(mut g) = app.state::<crate::AppState>().settings.try_lock() {
-        *g = settings;
-    }
+    let state = app.state::<crate::AppState>();
+    let mut g = state
+        .settings
+        .lock()
+        .map_err(|_| "settings lock poisoned".to_string())?;
+    *g = settings;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_json_uses_camel_case() {
+        let s = GlobalSettings::default();
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(v.get("defaultPreset").is_some());
+        assert!(v.get("maxConcurrentTasks").is_some());
+        assert!(v.get("concurrentFragments").is_some());
+    }
+
+    #[test]
+    fn save_roundtrip_matches_in_memory() {
+        let dir = std::env::temp_dir().join(format!(
+            "ytdlp-settings-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let s = GlobalSettings {
+            default_preset: "best".into(),
+            max_concurrent_tasks: 3,
+            proxy: Some("http://127.0.0.1:7890".into()),
+            ..Default::default()
+        };
+        crate::validate::validate_settings(&s).unwrap();
+        crate::fsutil::atomic_write_json(&path, &s).unwrap();
+        let got: GlobalSettings =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(got.default_preset, s.default_preset);
+        assert_eq!(got.max_concurrent_tasks, s.max_concurrent_tasks);
+        assert_eq!(got.proxy, s.proxy);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 fn file_path_string(p: tauri_plugin_dialog::FilePath) -> String {

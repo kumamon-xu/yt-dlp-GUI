@@ -31,38 +31,68 @@ pub fn parse_progress(line: &str) -> Option<(String, u64, u64, f64, f64, String)
     ))
 }
 
-/// stderr → 用户可见中文（先匹配先命中）
+#[derive(Debug, Clone)]
+pub struct AppError {
+    pub code: &'static str,
+    pub title: String,
+    #[allow(dead_code)]
+    pub detail: String,
+}
+
 pub fn friendly_error(stderr: &str) -> String {
+    classify_error(stderr).title
+}
+
+/// stderr → structured error. 404 alone is not always "video deleted".
+pub fn classify_error(stderr: &str) -> AppError {
     let t = stderr.trim();
     let lower = t.to_lowercase();
     let tail: String = t.lines().rev().take(3).collect::<Vec<_>>().join(" ");
 
-    if lower.contains("age confirmation") || lower.contains("sign in to confirm your age") {
-        "需要年龄验证：请导入浏览器 Cookies".into()
+    let (code, title) = if lower.contains("age confirmation")
+        || lower.contains("sign in to confirm your age")
+    {
+        ("AUTH_REQUIRED", "需要年龄验证：请导入浏览器 Cookies")
     } else if lower.contains("sign in to view full functionality")
         || (lower.contains("403") && lower.contains("bilibili"))
     {
-        "未登录：高清需要 Cookies".into()
+        ("AUTH_REQUIRED", "未登录：高清需要 Cookies")
     } else if lower.contains("unable to load cookies") || lower.contains("unable to read cookies") {
-        "请关闭目标浏览器后重试".into()
+        ("AUTH_REQUIRED", "请关闭目标浏览器后重试")
     } else if lower.contains("requested format is not available") {
-        "所选清晰度不存在，请换一档".into()
+        ("FORMAT_UNAVAILABLE", "所选清晰度不存在，请换一档")
     } else if lower.contains("ffmpeg") && lower.contains("not found") {
-        "未检测到 ffmpeg，合并/音频不可用".into()
+        ("FFMPEG_MISSING", "未检测到 ffmpeg，合并/音频不可用")
     } else if lower.contains("no video formats") {
-        "无法解析或需要登录/地区限制".into()
+        ("FORMAT_UNAVAILABLE", "无法解析或需要登录/地区限制")
     } else if lower.contains("unable to extract") {
-        "无法解析或需要登录/地区限制".into()
+        ("PROCESS_FAILED", "无法解析或需要登录/地区限制")
     } else if lower.contains("private video") {
-        "私密视频：需要登录且有权限".into()
+        ("AUTH_REQUIRED", "私密视频：需要登录且有权限")
     } else if lower.contains("unable to download") && lower.contains("proxy") {
-        "代理连接失败".into()
-    } else if lower.contains("timed out") || lower.contains("timeout") || lower.contains("socket.timeout") {
-        "网络超时，可重试或配置代理".into()
-    } else if lower.contains("404") || lower.contains("not found") || lower.contains("does not exist") {
-        "链接不存在或已删除".into()
+        ("NETWORK_TIMEOUT", "代理连接失败")
+    } else if lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("socket.timeout")
+    {
+        ("NETWORK_TIMEOUT", "网络超时，可重试或配置代理")
+    } else if lower.contains("http error 404")
+        && (lower.contains("webpage") || lower.contains("video"))
+    {
+        ("RESOURCE_NOT_FOUND", "链接不存在或已删除")
+    } else if lower.contains("404") {
+        ("PROCESS_FAILED", "下载过程出现 404（不一定是链接失效）")
     } else {
-        format!("失败：{tail}")
+        ("UNKNOWN", "任务失败")
+    };
+    AppError {
+        code,
+        title: if code == "UNKNOWN" && !tail.is_empty() {
+            format!("失败：{tail}")
+        } else {
+            title.into()
+        },
+        detail: tail,
     }
 }
 
@@ -93,8 +123,7 @@ mod tests {
 
     #[test]
     fn parse_title_with_pipe() {
-        let (_, _, _, _, _, title) =
-            parse_progress("YDLP|finished|1|1|1|0|foo|bar").unwrap();
+        let (_, _, _, _, _, title) = parse_progress("YDLP|finished|1|1|1|0|foo|bar").unwrap();
         assert_eq!(title, "foo|bar");
     }
 
@@ -128,6 +157,17 @@ mod tests {
         let s = friendly_error("line1\nweird unknown boom");
         assert!(s.starts_with("失败："), "{s}");
         assert!(!s.contains("解析失败"));
+    }
+
+    #[test]
+    fn bare_404_is_not_deleted_video() {
+        let e = classify_error("WARNING: fragment 3: HTTP Error 404");
+        assert_eq!(e.code, "PROCESS_FAILED");
+        assert!(!e.title.contains("链接不存在"));
+        assert!(!e.detail.is_empty());
+        let e = classify_error("ERROR: [youtube] abc: HTTP Error 404: Not Found webpage");
+        assert_eq!(e.code, "RESOURCE_NOT_FOUND");
+        assert!(e.detail.to_lowercase().contains("404"));
     }
 
     #[test]

@@ -15,8 +15,11 @@ import {
   removeTask,
   resumeTask,
   saveSettings,
+  resolveDownloadPreset,
+  retryTaskRequest,
   splitUrls,
   startTask,
+  isCurrentToken,
   toolError,
   type GlobalSettings,
   type NewTask,
@@ -76,13 +79,15 @@ interface AppState {
   previewError: string | null;
   selectedItems: string[];
   selectedFormat: string | null;
-  preview: (url: string) => Promise<void>;
+  preview: (url: string, flat?: boolean) => Promise<void>;
   toggleItem: (id: string) => void;
   setAllItems: (ids: string[], on: boolean) => void;
   selectFormat: (id: string) => void;
 
   tasks: TaskPayload[];
   logs: { id: string; line: string }[];
+  selectedTaskId: string | null;
+  selectTask: (id: string | null) => void;
   bindTaskEvents: () => Promise<void>;
   startDownload: (task: NewTask) => Promise<void>;
   enqueueUrls: (raw: string, extra?: Partial<NewTask>) => Promise<void>;
@@ -109,6 +114,7 @@ interface AppState {
 let previewToken = 0;
 let eventsBound = false;
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
+let saveSeq = 0;
 
 function readSavedLang(): Lang {
   try {
@@ -163,13 +169,13 @@ export const useAppStore = create<AppState>((set, get) => ({
   selectedItems: [],
   selectedFormat: null,
 
-  preview: async (url: string) => {
+  preview: async (url: string, flat = true) => {
     const token = ++previewToken;
     set({ previewStatus: "loading", previewUrl: url, previewError: null, selectedFormat: null });
     try {
       const enginePath = get().settings?.enginePath ?? null;
-      const info = await getInfo(url, enginePath);
-      if (token !== previewToken) return;
+      const info = await getInfo(url, enginePath, flat);
+      if (!isCurrentToken(token, previewToken)) return;
       const items = info.playlist ?? [];
       set({
         previewStatus: "ok",
@@ -177,7 +183,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         selectedItems: items.map((i) => i.id),
       });
     } catch (e) {
-      if (token !== previewToken) return;
+      if (!isCurrentToken(token, previewToken)) return;
       set({
         previewStatus: "error",
         previewInfo: null,
@@ -195,6 +201,8 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   tasks: [],
   logs: [],
+  selectedTaskId: null,
+  selectTask: (id) => set({ selectedTaskId: id }),
 
   bindTaskEvents: async () => {
     if (eventsBound) return;
@@ -208,7 +216,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       });
     });
     await listen<{ id: string; line: string }>("task_log", (e) => {
-      set((s) => ({ logs: [...s.logs, e.payload].slice(-400) }));
+      set((s) => {
+        const byId = s.logs.filter((l) => l.id === e.payload.id);
+        const others = s.logs.filter((l) => l.id !== e.payload.id);
+        const nextFor = [...byId, e.payload].slice(-200);
+        return { logs: [...others, ...nextFor].slice(-800) };
+      });
     });
     try {
       const existing = await listTasks();
@@ -225,7 +238,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const s = get().settings;
     return {
       url,
-      preset: o.preset || s?.defaultPreset || DEFAULT_PRESET,
+      preset: resolveDownloadPreset(extra?.preset, o.preset, s?.defaultPreset || DEFAULT_PRESET),
       customFormat: o.customFormat || undefined,
       outDir: o.outDir || s?.outDir || undefined,
       outTemplate: o.outTemplate || s?.outTemplate || undefined,
@@ -255,8 +268,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       speed: 0,
       eta: 0,
       filePath: null,
+      outputFiles: [],
       error: null,
       request: task,
+      kind: task.kind,
     };
     set((s) => ({ tasks: [stub, ...s.tasks] }));
     try {
@@ -287,7 +302,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   retry: async (id) => {
     const row = get().tasks.find((t) => t.id === id);
     if (!row) return;
-    await get().startDownload({ ...row.request, url: row.url, resume: true });
+    await get().startDownload(retryTaskRequest(row));
   },
 
   options: defaultOptions(),
@@ -347,8 +362,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
   persistSettings: async (settings) => {
+    const token = ++saveSeq;
     await saveSettings(settings);
-    set({ settings });
+    if (token !== saveSeq) return;
+    set({
+      settings,
+      options: { ...get().options, preset: settings.defaultPreset || get().options.preset },
+    });
   },
 
   settingsOpen: false,

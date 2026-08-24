@@ -2,9 +2,12 @@
 
 mod command;
 mod config;
+mod fsutil;
 mod info;
+mod locate;
 mod parser;
 mod tasks;
+mod validate;
 
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -15,9 +18,24 @@ use tokio::process::Command;
 pub use config::GlobalSettings;
 
 static RESOURCE_DIR: OnceLock<PathBuf> = OnceLock::new();
+static MANAGED_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 pub(crate) fn set_resource_dir(dir: PathBuf) {
     let _ = RESOURCE_DIR.set(dir);
+}
+
+pub(crate) fn set_managed_dir(dir: PathBuf) {
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = MANAGED_DIR.set(dir);
+}
+
+pub(crate) fn current_lookup() -> locate::ToolLookup {
+    locate::ToolLookup {
+        resource_dir: RESOURCE_DIR.get().cloned(),
+        managed_dir: MANAGED_DIR.get().cloned(),
+        dev_code_dir: std::env::current_dir().ok().map(|c| c.join("code")),
+        allow_path: true,
+    }
 }
 
 #[cfg(windows)]
@@ -28,7 +46,7 @@ fn no_window(cmd: &mut Command) {
     cmd.creation_flags(CREATE_NO_WINDOW);
 }
 #[cfg(not(windows))]
-pub(crate) fn no_window(_cmd: &mut Command) {}
+fn no_window(_cmd: &mut Command) {}
 
 #[cfg(unix)]
 fn unix_process_group(cmd: &mut Command) {
@@ -50,107 +68,25 @@ pub struct AppState {
     pub settings: Mutex<GlobalSettings>,
 }
 
-fn bin_name(base: &str) -> String {
-    if cfg!(windows) && !base.ends_with(".exe") {
-        format!("{base}.exe")
-    } else {
-        base.to_string()
-    }
+pub(crate) fn find_engine(override_path: Option<&str>) -> Result<PathBuf, String> {
+    locate::locate_tool("yt-dlp", override_path, &current_lookup()).map(|(p, _)| p)
 }
 
-fn which_on_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let p = dir.join(name);
-        if is_tool_file(&p) {
-            return Some(p);
-        }
-    }
-    None
-}
-
-fn is_tool_file(p: &Path) -> bool {
-    if !p.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = p.metadata() {
-            if meta.permissions().mode() & 0o111 == 0 {
-                let mut perms = meta.permissions();
-                perms.set_mode(perms.mode() | 0o755);
-                let _ = std::fs::set_permissions(p, perms);
-            }
-        }
-    }
-    true
-}
-
-fn push_dir_tools(candidates: &mut Vec<PathBuf>, dir: &Path, name: &str) {
-    candidates.push(dir.join(name));
-    candidates.push(dir.join("code").join(name));
-}
-
-/// resource_dir → CWD/code → exe 旁 → Contents/Resources (macOS) → PATH
-pub(crate) fn find_tool(base: &str) -> Option<PathBuf> {
-    let name = bin_name(base);
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(dir) = RESOURCE_DIR.get() {
-        push_dir_tools(&mut candidates, dir, &name);
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        push_dir_tools(&mut candidates, &cwd, &name);
-        candidates.push(cwd.join("..").join("code").join(&name));
-        candidates.push(cwd.join(&name));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            push_dir_tools(&mut candidates, dir, &name);
-            candidates.push(dir.join("..").join("code").join(&name));
-            candidates.push(dir.join("resources").join("code").join(&name));
-            candidates.push(dir.join("resources").join(&name));
-            #[cfg(target_os = "macos")]
-            {
-                let resources = dir.join("..").join("Resources");
-                push_dir_tools(&mut candidates, &resources, &name);
-            }
-        }
-    }
-    for c in candidates {
-        let p = c.canonicalize().unwrap_or(c);
-        if is_tool_file(&p) {
-            return Some(p);
-        }
-    }
-    which_on_path(&name)
-}
-
-pub(crate) fn find_engine(override_path: Option<&str>) -> Option<PathBuf> {
-    if let Some(p) = override_path.map(str::trim).filter(|s| !s.is_empty()) {
-        let pb = PathBuf::from(p);
-        if pb.is_file() {
-            return Some(pb);
-        }
-    }
-    find_tool("yt-dlp")
-}
-
-pub(crate) fn find_ffmpeg(override_path: Option<&str>) -> Option<PathBuf> {
-    if let Some(p) = override_path.map(str::trim).filter(|s| !s.is_empty()) {
-        let pb = PathBuf::from(p);
-        if pb.is_file() {
-            return Some(pb);
-        }
-    }
-    find_tool("ffmpeg")
+pub(crate) fn find_ffmpeg(override_path: Option<&str>) -> Result<PathBuf, String> {
+    locate::locate_tool("ffmpeg", override_path, &current_lookup()).map(|(p, _)| p)
 }
 
 pub(crate) fn js_runtime_arg() -> Option<String> {
-    if which_on_path(&bin_name("deno")).is_some() {
+    let path_only = locate::ToolLookup {
+        allow_path: true,
+        ..Default::default()
+    };
+    if locate::locate_tool("deno", None, &path_only).is_ok() {
         return None;
     }
-    which_on_path(&bin_name("node")).map(|p| format!("node:{}", p.to_string_lossy()))
+    locate::locate_tool("node", None, &path_only)
+        .ok()
+        .map(|(p, _)| format!("node:{}", p.to_string_lossy()))
 }
 
 pub(crate) fn kill_process_tree(pid: u32) {
@@ -181,9 +117,20 @@ pub struct ToolStatus {
     pub path: Option<String>,
     pub version: Option<String>,
     pub error: Option<String>,
+    pub source: Option<locate::ToolSource>,
 }
 
-async fn probe(bin: &Path, extra_args: &[&str]) -> ToolStatus {
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineUpdateResult {
+    pub updated: bool,
+    pub old_version: Option<String>,
+    pub new_version: Option<String>,
+    pub message: String,
+    pub source: locate::ToolSource,
+}
+
+async fn probe(bin: &Path, extra_args: &[&str], source: locate::ToolSource) -> ToolStatus {
     let bin_str = bin.to_string_lossy().to_string();
     let out = match no_window_cmd(bin).args(extra_args).output().await {
         Ok(o) => o,
@@ -193,6 +140,7 @@ async fn probe(bin: &Path, extra_args: &[&str]) -> ToolStatus {
                 path: Some(bin_str),
                 version: None,
                 error: Some(e.to_string()),
+                source: Some(source),
             }
         }
     };
@@ -207,6 +155,7 @@ async fn probe(bin: &Path, extra_args: &[&str]) -> ToolStatus {
             path: Some(bin_str),
             version: None,
             error: Some(err),
+            source: Some(source),
         };
     }
     let first_line = String::from_utf8_lossy(&out.stdout)
@@ -220,6 +169,7 @@ async fn probe(bin: &Path, extra_args: &[&str]) -> ToolStatus {
         path: Some(bin_str),
         version: Some(first_line),
         error: None,
+        source: Some(source),
     }
 }
 
@@ -243,72 +193,139 @@ fn overrides(state: &AppState) -> (Option<String>, Option<String>) {
 #[tauri::command]
 async fn check_engine(state: tauri::State<'_, AppState>) -> Result<ToolStatus, String> {
     let (eng, _) = overrides(&state);
-    match find_engine(eng.as_deref()) {
-        Some(p) => Ok(probe(&p, &["--version"]).await),
-        None => Err("未找到 yt-dlp 引擎：请在 code/ 目录放置 yt-dlp，或在设置中指定路径".into()),
-    }
+    let (p, src) = locate::locate_tool("yt-dlp", eng.as_deref(), &current_lookup())?;
+    Ok(probe(&p, &["--version"], src).await)
 }
 
 #[tauri::command]
 async fn check_ffmpeg(state: tauri::State<'_, AppState>) -> Result<ToolStatus, String> {
     let (_, ff) = overrides(&state);
-    match find_ffmpeg(ff.as_deref()) {
-        Some(p) => Ok(probe(&p, &["-version"]).await),
-        None => Err("未找到 ffmpeg：请将 ffmpeg 放到 code/ 目录".into()),
-    }
+    let (p, src) = locate::locate_tool("ffmpeg", ff.as_deref(), &current_lookup())?;
+    Ok(probe(&p, &["-version"], src).await)
 }
 
 #[tauri::command]
 async fn check_js_runtime() -> ToolStatus {
-    if let Some(p) = which_on_path(&bin_name("deno")) {
-        return probe(&p, &["--version"]).await;
+    let path_only = locate::ToolLookup {
+        allow_path: true,
+        ..Default::default()
+    };
+    if let Ok((p, src)) = locate::locate_tool("deno", None, &path_only) {
+        return probe(&p, &["--version"], src).await;
     }
-    if let Some(p) = which_on_path(&bin_name("node")) {
-        return probe(&p, &["--version"]).await;
+    if let Ok((p, src)) = locate::locate_tool("node", None, &path_only) {
+        return probe(&p, &["--version"], src).await;
     }
     ToolStatus {
         available: false,
         path: None,
         version: None,
         error: Some("未找到 JS 运行时（deno/node）：YouTube 播放列表/频道页解析需要".into()),
+        source: None,
     }
 }
 
 #[tauri::command]
 fn engine_path(state: tauri::State<'_, AppState>) -> Option<String> {
     let (eng, _) = overrides(&state);
-    find_engine(eng.as_deref()).map(|p| p.to_string_lossy().to_string())
+    find_engine(eng.as_deref())
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
 }
 
 #[tauri::command]
 fn ffmpeg_path(state: tauri::State<'_, AppState>) -> Option<String> {
     let (_, ff) = overrides(&state);
-    find_ffmpeg(ff.as_deref()).map(|p| p.to_string_lossy().to_string())
+    find_ffmpeg(ff.as_deref())
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
 }
 
 #[tauri::command]
-fn build_command(state: tauri::State<'_, AppState>, task: command::NewTask) -> Result<String, String> {
+fn build_command(
+    state: tauri::State<'_, AppState>,
+    task: command::NewTask,
+) -> Result<String, String> {
     let (eng, ff) = overrides(&state);
-    let engine = find_engine(eng.as_deref()).ok_or_else(|| "未找到 yt-dlp 引擎".to_string())?;
+    let engine = find_engine(eng.as_deref())?;
     let mut cfg = task.to_config();
-    cfg.ffmpeg_location = find_ffmpeg(ff.as_deref()).map(|p| p.to_string_lossy().into());
+    cfg.ffmpeg_location = find_ffmpeg(ff.as_deref())
+        .ok()
+        .map(|p| p.to_string_lossy().into());
     cfg.js_runtime = js_runtime_arg();
     let args = command::build_args(&cfg);
     Ok(command::format_command(&engine.to_string_lossy(), &args))
 }
 
+fn is_under(path: &Path, root: Option<&PathBuf>) -> bool {
+    let Some(root) = root else {
+        return false;
+    };
+    let Ok(path) = path.canonicalize() else {
+        return false;
+    };
+    let Ok(root) = root.canonicalize() else {
+        return false;
+    };
+    path.starts_with(root)
+}
+
+pub(crate) fn resolve_update_target(
+    src_path: PathBuf,
+    src: locate::ToolSource,
+    resource_dir: Option<&PathBuf>,
+    managed_dir: Option<&PathBuf>,
+) -> Result<(PathBuf, locate::ToolSource), String> {
+    let target = if src == locate::ToolSource::Bundled {
+        let dir = managed_dir.ok_or_else(|| "未配置用户引擎目录".to_string())?;
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let dest = dir.join(locate::bin_name("yt-dlp"));
+        std::fs::copy(&src_path, &dest).map_err(|e| format!("无法复制到用户目录：{e}"))?;
+        dest
+    } else {
+        src_path
+    };
+    if is_under(&target, resource_dir) {
+        return Err("拒绝修改安装包内的 bundled 引擎".into());
+    }
+    let new_src = if src == locate::ToolSource::Bundled {
+        locate::ToolSource::Managed
+    } else {
+        src
+    };
+    Ok((target, new_src))
+}
+
 #[tauri::command]
-async fn update_engine(state: tauri::State<'_, AppState>) -> Result<String, String> {
+async fn update_engine(state: tauri::State<'_, AppState>) -> Result<EngineUpdateResult, String> {
     let (eng, _) = overrides(&state);
-    let engine = find_engine(eng.as_deref()).ok_or_else(|| "未找到 yt-dlp 引擎".to_string())?;
-    let out = no_window_cmd(&engine)
+    let (src_path, src) = locate::locate_tool("yt-dlp", eng.as_deref(), &current_lookup())?;
+    let old = probe(&src_path, &["--version"], src).await.version;
+    let (target, new_src) =
+        resolve_update_target(src_path, src, RESOURCE_DIR.get(), MANAGED_DIR.get())?;
+    let out = no_window_cmd(&target)
         .arg("-U")
         .output()
         .await
         .map_err(|e| e.to_string())?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    Ok(format!("{stdout}{stderr}").trim().to_string())
+    let message = format!("{stdout}{stderr}").trim().to_string();
+    if !out.status.success() {
+        return Err(if message.is_empty() {
+            "yt-dlp -U 失败".into()
+        } else {
+            message
+        });
+    }
+    let new = probe(&target, &["--version"], new_src).await.version;
+    Ok(EngineUpdateResult {
+        updated: old != new,
+        old_version: old,
+        new_version: new,
+        message,
+        source: new_src,
+    })
 }
 
 fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
@@ -318,10 +335,7 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let show = MenuItem::with_id(app, "show", "显示", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quit])?;
-    let icon = app
-        .default_window_icon()
-        .cloned()
-        .ok_or("no window icon")?;
+    let icon = app.default_window_icon().cloned().ok_or("no window icon")?;
     TrayIconBuilder::new()
         .icon(icon)
         .menu(&menu)
@@ -356,7 +370,6 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             settings: Mutex::new(GlobalSettings::default()),
@@ -365,6 +378,9 @@ pub fn run() {
         .setup(|app| {
             if let Ok(dir) = app.path().resource_dir() {
                 set_resource_dir(dir);
+            }
+            if let Ok(dir) = app.path().app_local_data_dir() {
+                set_managed_dir(dir.join("engines"));
             }
             let s = config::load_from_disk(app.handle());
             if let Ok(mut g) = app.state::<AppState>().settings.lock() {
@@ -404,21 +420,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bin_name_matches_platform() {
-        #[cfg(windows)]
-        {
-            assert_eq!(bin_name("yt-dlp"), "yt-dlp.exe");
-            assert_eq!(bin_name("ffmpeg"), "ffmpeg.exe");
-        }
-        #[cfg(not(windows))]
-        {
-            assert_eq!(bin_name("yt-dlp"), "yt-dlp");
-            assert_eq!(bin_name("ffmpeg"), "ffmpeg");
-        }
+    fn kill_process_tree_ignores_pid_zero() {
+        kill_process_tree(0);
     }
 
     #[test]
-    fn kill_process_tree_ignores_pid_zero() {
-        kill_process_tree(0);
+    fn refuses_update_under_resource_dir() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ytdlp-res-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(tmp.join("code")).unwrap();
+        let bundled = tmp.join("code").join(locate::bin_name("yt-dlp"));
+        std::fs::write(&bundled, b"engine").unwrap();
+        assert!(!is_under(&bundled, None));
+        assert!(is_under(&bundled, Some(&tmp)));
+        let err = resolve_update_target(
+            bundled.clone(),
+            locate::ToolSource::Override,
+            Some(&tmp),
+            Some(&tmp.join("engines")),
+        );
+        assert!(err.is_err(), "{err:?}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn bundled_update_copies_to_managed_and_leaves_source() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ytdlp-upd-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let resource = tmp.join("res");
+        let managed = tmp.join("engines");
+        std::fs::create_dir_all(resource.join("code")).unwrap();
+        let src = resource.join("code").join(locate::bin_name("yt-dlp"));
+        std::fs::write(&src, b"bundled-bytes").unwrap();
+        let (dest, kind) = resolve_update_target(
+            src.clone(),
+            locate::ToolSource::Bundled,
+            Some(&resource),
+            Some(&managed),
+        )
+        .unwrap();
+        assert_eq!(kind, locate::ToolSource::Managed);
+        assert_eq!(dest, managed.join(locate::bin_name("yt-dlp")));
+        assert_eq!(std::fs::read(&src).unwrap(), b"bundled-bytes");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"bundled-bytes");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

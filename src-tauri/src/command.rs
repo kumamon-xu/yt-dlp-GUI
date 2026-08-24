@@ -152,6 +152,18 @@ pub fn build_preview_args(
     a
 }
 
+pub fn build_preview_args_flat(
+    url: &str,
+    cookies_file: Option<&str>,
+    cookies_browser: Option<&str>,
+    proxy: Option<&str>,
+    js_runtime: Option<&str>,
+) -> Vec<String> {
+    let mut a = build_preview_args(url, cookies_file, cookies_browser, proxy, js_runtime);
+    a.insert(1, "--flat-playlist".into());
+    a
+}
+
 pub fn default_out_dir() -> String {
     #[cfg(windows)]
     {
@@ -168,18 +180,18 @@ pub fn default_out_dir() -> String {
 }
 
 pub fn build_args(cfg: &TaskConfig) -> Vec<String> {
-    let mut a: Vec<String> = Vec::new();
-
-    a.push("--no-color".into());
-    a.push("--newline".into());
-    a.push("--windows-filenames".into());
-    a.push("--progress-delta".into());
-    a.push("0.3".into());
-    a.push("--progress-template".into());
-    a.push(DOWNLOAD_TPL.into());
-    a.push("-O".into());
-    a.push(FILE_PRINT.into());
-    a.push("--ignore-config".into());
+    let mut a: Vec<String> = vec![
+        "--no-color".into(),
+        "--newline".into(),
+        "--windows-filenames".into(),
+        "--progress-delta".into(),
+        "0.3".into(),
+        "--progress-template".into(),
+        DOWNLOAD_TPL.into(),
+        "-O".into(),
+        FILE_PRINT.into(),
+        "--ignore-config".into(),
+    ];
 
     if let Some(ff) = cfg.ffmpeg_location.as_ref().filter(|s| !s.is_empty()) {
         a.push("--ffmpeg-location".into());
@@ -239,11 +251,7 @@ pub fn build_args(cfg: &TaskConfig) -> Vec<String> {
         cfg.out_template.clone()
     });
 
-    let n = if cfg.concurrent_fragments == 0 {
-        4
-    } else {
-        cfg.concurrent_fragments
-    };
+    let n = crate::validate::validate_concurrent_fragments(cfg.concurrent_fragments).unwrap_or(4);
     a.push("-N".into());
     a.push(n.to_string());
     a.push("-R".into());
@@ -335,6 +343,17 @@ fn default_preset_str() -> String {
     "mp4".into()
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum TaskKind {
+    #[default]
+    Video,
+    Audio,
+    Subtitles,
+    Thumbnail,
+    Metadata,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NewTask {
@@ -387,6 +406,8 @@ pub struct NewTask {
     pub convert_subs: Option<String>,
     #[serde(default)]
     pub write_info_json: Option<bool>,
+    #[serde(default)]
+    pub kind: Option<TaskKind>,
 }
 
 impl NewTask {
@@ -568,13 +589,17 @@ mod tests {
             write_thumbnail: None,
             convert_subs: None,
             write_info_json: None,
+            kind: None,
         };
         assert_eq!(t.to_config().preset, Preset::Mp4Prefer);
     }
 
     #[test]
     fn quote_command_wraps_spaces() {
-        let s = format_command(r"C:\Program Files\yt-dlp.exe", &["-f".into(), "bv*+ba/b".into()]);
+        let s = format_command(
+            r"C:\Program Files\yt-dlp.exe",
+            &["-f".into(), "bv*+ba/b".into()],
+        );
         assert!(s.starts_with('"'), "{s}");
         assert!(s.contains("yt-dlp.exe"));
     }
@@ -602,5 +627,13 @@ mod tests {
         let a = build_preview_args("https://x", None, Some("chrome"), None, None);
         assert_eq!(after(&a, "--cookies-from-browser"), "chrome");
         assert!(!a.iter().any(|x| x == "--cookies"));
+    }
+
+    #[test]
+    fn preview_flat_inserts_flag_after_dash_j() {
+        let a = build_preview_args_flat("https://x", None, None, None, None);
+        assert_eq!(a[0], "-J");
+        assert_eq!(a[1], "--flat-playlist");
+        assert_eq!(a.last().unwrap(), "https://x");
     }
 }

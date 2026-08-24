@@ -2,9 +2,9 @@
   "$schema": "https://schema.tauri.app/config/2",
   "bundle": {
     "targets": ["dmg"],
-    "resources": [
-      "../code/yt-dlp",
-      "../code/ffmpeg"
-    ]
+    "resources": {
+      "../code/yt-dlp": "code/yt-dlp",
+      "../code/ffmpeg": "code/ffmpeg"
+    }
   }
 }

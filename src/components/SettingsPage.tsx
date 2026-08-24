@@ -1,8 +1,23 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { X } from "lucide-react";
 import { useAppStore, useT } from "../store";
-import { pickDir, pickFile, updateEngine, type GlobalSettings } from "../lib/ytdlp";
+import { pickDir, pickFile, settingsDraftDirty, updateEngine, type GlobalSettings } from "../lib/ytdlp";
 import { DEFAULT_PRESET } from "../presets";
+
+const emptySettings = (): GlobalSettings => ({
+  defaultPreset: DEFAULT_PRESET,
+  outDir: "",
+  outTemplate: "%(title)s [%(id)s].%(ext)s",
+  concurrentFragments: 4,
+  maxConcurrentTasks: 2,
+  limitRate: null,
+  cookiesBrowser: null,
+  cookiesFile: null,
+  proxy: null,
+  enginePath: null,
+  ffmpegPath: null,
+  mergeFormat: "mp4",
+});
 
 export default function SettingsPage() {
   const open = useAppStore((s) => s.settingsOpen);
@@ -13,26 +28,22 @@ export default function SettingsPage() {
   const lang = useAppStore((s) => s.lang);
   const setLang = useAppStore((s) => s.setLang);
   const [msg, setMsg] = useState("");
+  const [draft, setDraft] = useState<GlobalSettings>(emptySettings());
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    if (open) {
+      setDraft(settings ?? emptySettings());
+      setMsg("");
+      setErr("");
+    }
+  }, [open, settings]);
 
   if (!open) return null;
 
-  const s: GlobalSettings = settings ?? {
-    defaultPreset: DEFAULT_PRESET,
-    outDir: "",
-    outTemplate: "%(title)s [%(id)s].%(ext)s",
-    concurrentFragments: 4,
-    maxConcurrentTasks: 2,
-    limitRate: null,
-    cookiesBrowser: null,
-    cookiesFile: null,
-    proxy: null,
-    enginePath: null,
-    ffmpegPath: null,
-    mergeFormat: "mp4",
-  };
-
-  const patch = (p: Partial<GlobalSettings>) => persist({ ...s, ...p });
   const field = "w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1.5 text-xs text-slate-200";
+  const patch = (p: Partial<GlobalSettings>) => setDraft({ ...draft, ...p });
+  const dirty = settings ? settingsDraftDirty(draft, settings) : true;
 
   return (
     <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/60 p-6">
@@ -45,14 +56,29 @@ export default function SettingsPage() {
         </div>
         <div className="space-y-3">
           <label className="block text-[11px] text-slate-500">
+            {t("settings.defaultPreset")}
+            <select
+              className={`${field} mt-1`}
+              value={draft.defaultPreset}
+              onChange={(e) => patch({ defaultPreset: e.target.value })}
+            >
+              <option value="mp4">{t("preset.mp4")}</option>
+              <option value="best">{t("preset.best")}</option>
+              <option value="1080p">{t("preset.1080p")}</option>
+              <option value="720p">{t("preset.720p")}</option>
+              <option value="mp3">{t("preset.mp3")}</option>
+              <option value="m4a">{t("preset.m4a")}</option>
+            </select>
+          </label>
+          <label className="block text-[11px] text-slate-500">
             {t("settings.engine")}
             <div className="mt-1 flex gap-1">
-              <input className={field} value={s.enginePath ?? ""} onChange={(e) => void patch({ enginePath: e.target.value || null })} />
+              <input className={field} value={draft.enginePath ?? ""} onChange={(e) => patch({ enginePath: e.target.value || null })} />
               <button
                 className="rounded-md border border-slate-700 px-2 text-xs"
                 onClick={async () => {
                   const f = await pickFile();
-                  if (f) void patch({ enginePath: f });
+                  if (f) patch({ enginePath: f });
                 }}
               >
                 …
@@ -62,12 +88,12 @@ export default function SettingsPage() {
           <label className="block text-[11px] text-slate-500">
             {t("settings.ffmpeg")}
             <div className="mt-1 flex gap-1">
-              <input className={field} value={s.ffmpegPath ?? ""} onChange={(e) => void patch({ ffmpegPath: e.target.value || null })} />
+              <input className={field} value={draft.ffmpegPath ?? ""} onChange={(e) => patch({ ffmpegPath: e.target.value || null })} />
               <button
                 className="rounded-md border border-slate-700 px-2 text-xs"
                 onClick={async () => {
                   const f = await pickFile();
-                  if (f) void patch({ ffmpegPath: f });
+                  if (f) patch({ ffmpegPath: f });
                 }}
               >
                 …
@@ -77,12 +103,12 @@ export default function SettingsPage() {
           <label className="block text-[11px] text-slate-500">
             {t("opt.dir")}
             <div className="mt-1 flex gap-1">
-              <input className={field} value={s.outDir} onChange={(e) => void patch({ outDir: e.target.value })} />
+              <input className={field} value={draft.outDir} onChange={(e) => patch({ outDir: e.target.value })} />
               <button
                 className="rounded-md border border-slate-700 px-2 text-xs"
                 onClick={async () => {
                   const d = await pickDir();
-                  if (d) void patch({ outDir: d });
+                  if (d) patch({ outDir: d });
                 }}
               >
                 …
@@ -94,9 +120,10 @@ export default function SettingsPage() {
             <input
               type="number"
               min={1}
+              max={8}
               className={`${field} mt-1`}
-              value={s.maxConcurrentTasks}
-              onChange={(e) => void patch({ maxConcurrentTasks: Number(e.target.value) || 2 })}
+              value={draft.maxConcurrentTasks}
+              onChange={(e) => patch({ maxConcurrentTasks: Number(e.target.value) || 2 })}
             />
           </label>
           <label className="block text-[11px] text-slate-500">
@@ -106,12 +133,40 @@ export default function SettingsPage() {
               <option value="en">English</option>
             </select>
           </label>
+          {err && <p className="text-xs text-red-400">{err}</p>}
+          <div className="flex gap-2">
+            <button
+              disabled={!dirty}
+              className="rounded-md bg-sky-600 px-3 py-1.5 text-xs text-white hover:bg-sky-500 disabled:opacity-40"
+              onClick={async () => {
+                setErr("");
+                try {
+                  await persist(draft);
+                  setMsg(t("settings.saved"));
+                } catch (e) {
+                  setErr(String(e));
+                }
+              }}
+            >
+              {t("action.save")}
+            </button>
+            <button
+              className="rounded-md border border-slate-700 px-3 py-1.5 text-xs"
+              onClick={() => {
+                setDraft(settings ?? emptySettings());
+                setOpen(false);
+              }}
+            >
+              {t("action.cancel")}
+            </button>
+          </div>
           <button
-            className="rounded-md bg-sky-600 px-3 py-1.5 text-xs text-white hover:bg-sky-500"
+            className="rounded-md border border-slate-700 px-3 py-1.5 text-xs text-slate-200 hover:bg-slate-800"
             onClick={async () => {
               setMsg("…");
               try {
-                setMsg(await updateEngine());
+                const r = await updateEngine();
+                setMsg(r.message || `${r.oldVersion ?? "?"} → ${r.newVersion ?? "?"}`);
               } catch (e) {
                 setMsg(String(e));
               }

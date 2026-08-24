@@ -20,21 +20,21 @@ export default function Toolbox() {
         <button
           className={btn}
           disabled={!url}
-          onClick={() => run({ skipDownload: true, writeSubs: true, convertSubs: "srt", noPlaylist: true })}
+          onClick={() => run({ skipDownload: true, writeSubs: true, convertSubs: "srt", noPlaylist: true, kind: "subtitles" })}
         >
           <Subtitles size={13} /> {t("tools.subs")}
         </button>
         <button
           className={btn}
           disabled={!url}
-          onClick={() => run({ skipDownload: true, writeThumbnail: true, noPlaylist: true })}
+          onClick={() => run({ skipDownload: true, writeThumbnail: true, noPlaylist: true, kind: "thumbnail" })}
         >
           <Image size={13} /> {t("tools.thumb")}
         </button>
         <button
           className={btn}
           disabled={!url}
-          onClick={() => run({ skipDownload: true, writeInfoJson: true, noPlaylist: true })}
+          onClick={() => run({ skipDownload: true, writeInfoJson: true, noPlaylist: true, kind: "metadata" })}
         >
           <FileJson size={13} /> {t("tools.meta")}
         </button>

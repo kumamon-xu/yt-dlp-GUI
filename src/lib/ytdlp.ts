@@ -1,10 +1,21 @@
 import { invoke } from "@tauri-apps/api/core";
 
+export type ToolSource = "override" | "managed" | "bundled" | "path";
+
 export interface ToolStatus {
   available: boolean;
   path: string | null;
   version: string | null;
   error: string | null;
+  source?: ToolSource | null;
+}
+
+export interface EngineUpdateResult {
+  updated: boolean;
+  oldVersion: string | null;
+  newVersion: string | null;
+  message: string;
+  source: ToolSource;
 }
 
 export interface FormatInfo {
@@ -52,17 +63,20 @@ export const checkFfmpeg = () => invoke<ToolStatus>("check_ffmpeg");
 export const checkJsRuntime = () => invoke<ToolStatus>("check_js_runtime");
 export const getEnginePath = () => invoke<string | null>("engine_path");
 export const getFfmpegPath = () => invoke<string | null>("ffmpeg_path");
-export const getInfo = (url: string, enginePath: string | null = null) =>
-  invoke<VideoInfo>("get_info", { url, enginePath });
+export const getInfo = (url: string, enginePath: string | null = null, flat = true) =>
+  invoke<VideoInfo>("get_info", { url, enginePath, flat });
 
 export type TaskStatus =
   | "queued"
+  | "starting"
   | "downloading"
   | "postprocess"
   | "paused"
   | "done"
   | "failed"
   | "canceled";
+
+export type TaskKind = "video" | "audio" | "subtitles" | "thumbnail" | "metadata";
 
 export interface NewTask {
   url: string;
@@ -90,6 +104,7 @@ export interface NewTask {
   writeThumbnail?: boolean;
   convertSubs?: string;
   writeInfoJson?: boolean;
+  kind?: TaskKind;
 }
 
 export interface TaskPayload {
@@ -102,8 +117,11 @@ export interface TaskPayload {
   speed: number;
   eta: number;
   filePath: string | null;
+  outputFiles?: string[];
   error: string | null;
+  errorCode?: string | null;
   request: NewTask;
+  kind?: TaskKind;
 }
 
 export interface GlobalSettings {
@@ -133,7 +151,7 @@ export const loadSettings = () => invoke<GlobalSettings>("load_settings");
 export const saveSettings = (settings: GlobalSettings) => invoke<void>("save_settings", { settings });
 export const pickDir = () => invoke<string | null>("pick_dir");
 export const pickFile = () => invoke<string | null>("pick_file");
-export const updateEngine = () => invoke<string>("update_engine");
+export const updateEngine = () => invoke<EngineUpdateResult>("update_engine");
 
 export function toolError(reason: unknown): ToolStatus {
   return {
@@ -141,6 +159,7 @@ export function toolError(reason: unknown): ToolStatus {
     path: null,
     version: null,
     error: reason instanceof Error ? reason.message : String(reason),
+    source: null,
   };
 }
 
@@ -149,4 +168,26 @@ export function splitUrls(raw: string): string[] {
     .split(/[\s,]+/)
     .map((s) => s.trim())
     .filter((s) => /^https?:\/\/\S+$/i.test(s));
+}
+
+export function resolveDownloadPreset(
+  extraPreset: string | undefined,
+  sessionPreset: string,
+  defaultPreset: string,
+): string {
+  if (extraPreset && extraPreset.trim()) return extraPreset;
+  if (sessionPreset && sessionPreset.trim()) return sessionPreset;
+  return defaultPreset || "mp4";
+}
+
+export function settingsDraftDirty(a: GlobalSettings, b: GlobalSettings): boolean {
+  return JSON.stringify(a) !== JSON.stringify(b);
+}
+
+export function retryTaskRequest(row: { url: string; request: NewTask }): NewTask {
+  return { ...row.request, url: row.url, resume: true };
+}
+
+export function isCurrentToken(token: number, latest: number): boolean {
+  return token === latest;
 }

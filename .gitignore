@@ -51,3 +51,5 @@ lerna-debug.log*
 # OS
 .DS_Store
 *.orig
+
+docs/*.png

@@ -1,6 +1,6 @@
 //! URL 元数据预览：yt-dlp -J（不下载）。新请求会杀掉上一次预览进程。
 
-use crate::command::build_preview_args;
+use crate::command::{build_preview_args, build_preview_args_flat};
 use crate::parser::friendly_error;
 use crate::AppState;
 use serde::Serialize;
@@ -114,7 +114,8 @@ fn extract_item(v: &Value) -> Option<PlaylistItem> {
         title: s(v, "title").unwrap_or_else(|| s(v, "display_id").unwrap_or_default()),
         thumbnail: s(v, "thumbnail"),
         duration: f(v, "duration"),
-        webpage_url: s(v, "webpage_url"),
+        // --flat-playlist entries expose `url`, not `webpage_url`.
+        webpage_url: s(v, "webpage_url").or_else(|| s(v, "url")),
         channel: s(v, "channel").or_else(|| s(v, "uploader")),
     })
 }
@@ -122,7 +123,8 @@ fn extract_item(v: &Value) -> Option<PlaylistItem> {
 pub fn parse_info_json(raw: &str) -> Result<VideoInfo, String> {
     let text = raw.trim();
     let start = text.find('{').ok_or_else(|| "返回内容为空".to_string())?;
-    let v: Value = serde_json::from_str(&text[start..]).map_err(|e| format!("JSON 解析失败：{e}"))?;
+    let v: Value =
+        serde_json::from_str(&text[start..]).map_err(|e| format!("JSON 解析失败：{e}"))?;
 
     let entries = v
         .get("entries")
@@ -172,7 +174,8 @@ pub fn parse_info_json(raw: &str) -> Result<VideoInfo, String> {
     })
 }
 
-const PREVIEW_TIMEOUT: Duration = Duration::from_secs(30);
+const PREVIEW_TIMEOUT_SINGLE: Duration = Duration::from_secs(30);
+const PREVIEW_TIMEOUT_FLAT: Duration = Duration::from_secs(60);
 
 fn preview_slot() -> &'static Mutex<Option<u32>> {
     static SLOT: OnceLock<Mutex<Option<u32>>> = OnceLock::new();
@@ -180,7 +183,12 @@ fn preview_slot() -> &'static Mutex<Option<u32>> {
 }
 
 #[tauri::command]
-pub async fn get_info(app: AppHandle, url: String, engine_path: Option<String>) -> Result<VideoInfo, String> {
+pub async fn get_info(
+    app: AppHandle,
+    url: String,
+    engine_path: Option<String>,
+    flat: Option<bool>,
+) -> Result<VideoInfo, String> {
     use crate::{find_engine, js_runtime_arg, kill_process_tree, no_window_cmd};
 
     let settings = app
@@ -195,16 +203,27 @@ pub async fn get_info(app: AppHandle, url: String, engine_path: Option<String>) 
         kill_process_tree(old);
     }
 
-    let engine_override = resolve_engine_override(engine_path.as_deref(), settings.engine_path.as_deref());
-    let engine = find_engine(engine_override.as_deref()).ok_or_else(|| "未找到 yt-dlp 引擎".to_string())?;
-
-    let args = build_preview_args(
-        &url,
-        settings.cookies_file.as_deref(),
-        settings.cookies_browser.as_deref(),
-        settings.proxy.as_deref(),
-        js_runtime_arg().as_deref(),
-    );
+    let engine_override =
+        resolve_engine_override(engine_path.as_deref(), settings.engine_path.as_deref());
+    let engine = find_engine(engine_override.as_deref())?;
+    let use_flat = flat.unwrap_or(true);
+    let args = if use_flat {
+        build_preview_args_flat(
+            &url,
+            settings.cookies_file.as_deref(),
+            settings.cookies_browser.as_deref(),
+            settings.proxy.as_deref(),
+            js_runtime_arg().as_deref(),
+        )
+    } else {
+        build_preview_args(
+            &url,
+            settings.cookies_file.as_deref(),
+            settings.cookies_browser.as_deref(),
+            settings.proxy.as_deref(),
+            js_runtime_arg().as_deref(),
+        )
+    };
 
     let mut cmd = no_window_cmd(&engine);
     cmd.args(&args)
@@ -218,7 +237,12 @@ pub async fn get_info(app: AppHandle, url: String, engine_path: Option<String>) 
         *preview_slot().lock().await = Some(p);
     }
 
-    let wait = tokio::time::timeout(PREVIEW_TIMEOUT, child.wait_with_output()).await;
+    let timeout = if use_flat {
+        PREVIEW_TIMEOUT_FLAT
+    } else {
+        PREVIEW_TIMEOUT_SINGLE
+    };
+    let wait = tokio::time::timeout(timeout, child.wait_with_output()).await;
     {
         let mut slot = preview_slot().lock().await;
         release_slot_if_owner(&mut slot, pid);
@@ -229,7 +253,10 @@ pub async fn get_info(app: AppHandle, url: String, engine_path: Option<String>) 
             if let Some(p) = pid {
                 kill_process_tree(p);
             }
-            return Err("解析超时（30s）：链接可能无效，或需要网络/代理/Cookies".into());
+            let secs = timeout.as_secs();
+            return Err(format!(
+                "解析超时（{secs}s）：链接可能无效，或需要网络/代理/Cookies"
+            ));
         }
         Ok(Err(e)) => return Err(friendly_error(&e.to_string())),
         Ok(Ok(o)) => o,
@@ -283,6 +310,43 @@ mod tests {
     }
 
     #[test]
+    fn flat_playlist_entries_use_url_when_no_webpage_url() {
+        let raw = r#"{
+            "_type": "playlist",
+            "id": "PL",
+            "title": "flat",
+            "playlist_count": 1,
+            "entries": [
+                {"id": "v1", "title": "ep", "url": "https://example.com/watch?v=v1", "duration": 9.0}
+            ]
+        }"#;
+        let info = parse_info_json(raw).unwrap();
+        let item = &info.playlist.as_ref().unwrap()[0];
+        assert_eq!(
+            item.webpage_url.as_deref(),
+            Some("https://example.com/watch?v=v1")
+        );
+    }
+
+    #[test]
+    fn parse_flat_playlist_thousand_entries() {
+        let mut entries = String::new();
+        for i in 0..1000 {
+            if i > 0 {
+                entries.push(',');
+            }
+            entries.push_str(&format!(r#"{{"id":"v{i}","title":"t{i}","duration":1.0}}"#));
+        }
+        let raw = format!(
+            r#"{{"_type":"playlist","id":"PL","title":"big","playlist_count":1000,"entries":[{entries}]}}"#
+        );
+        let info = parse_info_json(&raw).unwrap();
+        assert!(info.is_playlist);
+        assert_eq!(info.playlist.as_ref().unwrap().len(), 1000);
+        assert!(info.formats.is_empty());
+    }
+
+    #[test]
     fn engine_override_uses_settings_when_frontend_empty() {
         assert_eq!(
             resolve_engine_override(None, Some(r"D:\code\yt-dlp.exe")).as_deref(),
@@ -293,7 +357,8 @@ mod tests {
             Some(r"D:\code\yt-dlp.exe")
         );
         assert_eq!(
-            resolve_engine_override(Some(r"C:\custom\yt-dlp.exe"), Some(r"D:\code\yt-dlp.exe")).as_deref(),
+            resolve_engine_override(Some(r"C:\custom\yt-dlp.exe"), Some(r"D:\code\yt-dlp.exe"))
+                .as_deref(),
             Some(r"C:\custom\yt-dlp.exe")
         );
     }

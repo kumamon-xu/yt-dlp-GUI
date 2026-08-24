@@ -89,17 +89,20 @@ function VideoCard({ info }: { info: VideoInfo }) {
 }
 
 function PlaylistCard({ info }: { info: VideoInfo }) {
-  const items = info.playlist ?? [];
+  const [shown, setShown] = useState(100);
+  const items = (info.playlist ?? []).slice(0, shown);
   const selected = useAppStore((s) => s.selectedItems);
   const toggleItem = useAppStore((s) => s.toggleItem);
   const setAllItems = useAppStore((s) => s.setAllItems);
   const startDownload = useAppStore((s) => s.startDownload);
   const buildTask = useAppStore((s) => s.buildTaskFromOptions);
   const previewUrl = useAppStore((s) => s.previewUrl);
+  const preview = useAppStore((s) => s.preview);
   const t = useT();
-  const allIds = items.map((i) => i.id);
+  const all = info.playlist ?? [];
+  const allIds = all.map((i) => i.id);
   const allSelected = allIds.length > 0 && selected.length === allIds.length;
-  const playlistItems = items
+  const playlistItems = all
     .map((it, i) => (selected.includes(it.id) ? String(i + 1) : null))
     .filter(Boolean)
     .join(",");
@@ -116,26 +119,40 @@ function PlaylistCard({ info }: { info: VideoInfo }) {
         </div>
         <label className="flex cursor-pointer items-center gap-2 text-xs text-slate-300">
           <input type="checkbox" checked={allSelected} onChange={(e) => setAllItems(allIds, e.target.checked)} className="accent-sky-500" />
-          {t("preview.selectAll")}（{selected.length}/{items.length}）
+          {t("preview.selectAll")}（{selected.length}/{all.length}）
         </label>
       </div>
       <div className="max-h-56 space-y-1 overflow-y-auto rounded-lg border border-slate-800 bg-slate-900/50 p-1.5">
         {items.map((it, idx) => (
-          <label key={it.id} className="flex cursor-pointer items-center gap-3 rounded-md px-3 py-2 text-sm hover:bg-slate-800">
+          <div key={it.id} className="flex items-center gap-3 rounded-md px-3 py-2 text-sm hover:bg-slate-800">
             <input type="checkbox" checked={selected.includes(it.id)} onChange={() => toggleItem(it.id)} className="accent-sky-500" />
             <span className="w-8 shrink-0 text-right text-xs text-slate-600">{idx + 1}</span>
-            <span className="min-w-0 flex-1 truncate text-slate-200">{it.title}</span>
+            <button
+              type="button"
+              className="min-w-0 flex-1 truncate text-left text-slate-200 hover:text-sky-300"
+              title={t("preview.openItem")}
+              onClick={() => {
+                if (it.webpageUrl) void preview(it.webpageUrl, false);
+              }}
+            >
+              {it.title}
+            </button>
             {it.duration != null && <span className="shrink-0 text-xs text-slate-500">{fmtDuration(it.duration)}</span>}
-          </label>
+          </div>
         ))}
       </div>
+      {all.length > shown && (
+        <button className="text-xs text-sky-400" onClick={() => setShown((n) => n + 100)}>
+          {t("preview.loadMore")} ({shown}/{all.length})
+        </button>
+      )}
       <button
         disabled={selected.length === 0}
         onClick={() =>
           void startDownload(
             buildTask(previewUrl, {
               noPlaylist: false,
-              playlistItems: selected.length === items.length ? undefined : playlistItems,
+              playlistItems: selected.length === all.length ? undefined : playlistItems,
             }),
           )
         }

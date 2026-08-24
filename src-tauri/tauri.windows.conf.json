@@ -1,9 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "bundle": {
-    "resources": [
-      "../code/yt-dlp.exe",
-      "../code/ffmpeg.exe"
-    ]
+    "resources": {
+      "../code/yt-dlp.exe": "code/yt-dlp.exe",
+      "../code/ffmpeg.exe": "code/ffmpeg.exe"
+    }
   }
 }
