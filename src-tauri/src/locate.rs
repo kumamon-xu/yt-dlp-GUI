@@ -280,6 +280,14 @@ mod tests {
         assert!(ci.contains("fmt"));
         assert!(ci.contains("windows-latest"));
         assert!(ci.contains("macos-latest"));
+        let build =
+            std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build.rs"))
+                .unwrap();
+        assert!(
+            !build.contains("rustc-link-arg="),
+            "linking resource.lib via rustc-link-arg double-links the Windows app bin"
+        );
+        assert!(build.contains("rustc-link-search=native"));
         let sh = std::fs::read_to_string(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/check-bundled-engines.sh"),
         )

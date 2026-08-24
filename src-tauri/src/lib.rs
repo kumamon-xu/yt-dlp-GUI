@@ -1,5 +1,9 @@
 //! yt-dlp GUI — Rust 核心
 
+#[cfg(all(test, windows))]
+#[link(name = "resource", kind = "static")]
+extern "C" {}
+
 mod command;
 mod config;
 mod fsutil;
