@@ -4,7 +4,10 @@
     "targets": ["dmg"],
     "resources": {
       "../code/yt-dlp": "code/yt-dlp",
-      "../code/ffmpeg": "code/ffmpeg"
+      "../code/ffmpeg": "code/ffmpeg",
+      "../THIRD_PARTY_NOTICES.md": "licenses/THIRD_PARTY_NOTICES.md",
+      "../licenses/FFmpeg-GPL-3.0.txt": "licenses/FFmpeg-GPL-3.0.txt",
+      "../licenses/yt-dlp-Unlicense.txt": "licenses/yt-dlp-Unlicense.txt"
     }
   }
 }

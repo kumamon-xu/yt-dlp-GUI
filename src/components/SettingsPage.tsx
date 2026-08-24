@@ -23,6 +23,8 @@ export default function SettingsPage() {
   const open = useAppStore((s) => s.settingsOpen);
   const setOpen = useAppStore((s) => s.setSettingsOpen);
   const settings = useAppStore((s) => s.settings);
+  const engine = useAppStore((s) => s.engine);
+  const refresh = useAppStore((s) => s.refresh);
   const persist = useAppStore((s) => s.persistSettings);
   const t = useT();
   const lang = useAppStore((s) => s.lang);
@@ -166,7 +168,8 @@ export default function SettingsPage() {
             </button>
           </div>
           <button
-            disabled={updating}
+            disabled={updating || engine?.source === "override"}
+            title={engine?.source === "override" ? t("settings.overrideManagedExternally") : undefined}
             className="rounded-md border border-slate-700 px-3 py-1.5 text-xs text-slate-200 hover:bg-slate-800 disabled:opacity-40"
             onClick={async () => {
               setMsg("…");
@@ -174,6 +177,7 @@ export default function SettingsPage() {
               try {
                 const r = await updateEngine();
                 setMsg(r.message || `${r.oldVersion ?? "?"} → ${r.newVersion ?? "?"}`);
+                await refresh();
               } catch (e) {
                 setMsg(String(e));
               } finally {
@@ -183,6 +187,9 @@ export default function SettingsPage() {
           >
             {t("settings.update")}
           </button>
+          {engine?.source === "override" && (
+            <p className="text-[11px] text-amber-400">{t("settings.overrideManagedExternally")}</p>
+          )}
           {msg && <pre className="max-h-32 overflow-auto whitespace-pre-wrap text-[11px] text-slate-400">{msg}</pre>}
         </div>
       </div>

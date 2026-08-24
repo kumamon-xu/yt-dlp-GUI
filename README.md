@@ -17,7 +17,7 @@ Windows, Linux, and macOS. Defaults to Chinese UI (English available). Optimized
 ## Features
 
 - **Preview** — title, thumbnail, duration, format list (height + codec). Playlists / 合集 with multi-select.
-- **Downloads** — live progress, speed, ETA. Cancel kills the process tree (yt-dlp + ffmpeg). Pause / resume via `--continue`.
+- **Downloads** — live progress, speed, ETA. Cancel kills the process tree (yt-dlp + ffmpeg). Windows uses `taskkill /F /T`; Unix sends the process group `SIGTERM`, waits for the grace period, then uses `SIGKILL` if descendants remain. Pause / resume via `--continue`.
 - **Queue** — default 2 concurrent jobs; extra URLs wait in line. Survives app restart (in-flight tasks come back paused).
 - **Options** — presets (MP4 by default), cookies (browser or Netscape file), HTTP/SOCKS proxy, rate limit, subtitles, SponsorBlock. Live **command preview** you can copy.
 - **Toolbox** — subtitles only, thumbnail only, metadata JSON (same download pipeline).
@@ -44,11 +44,11 @@ Install from [Releases](https://github.com/kumamon-xu/yt-dlp-GUI/releases/latest
 | Linux x64 / arm64 | `.AppImage` or `.deb` | AppImage: `chmod +x` then run. deb needs WebKitGTK 4.1 |
 | macOS | `.dmg` (Apple Silicon and Intel) | Unsigned: right-click the app → Open (Gatekeeper) |
 
-YouTube playlist / channel pages may also need **Deno** or **Node** on `PATH` (yt-dlp 2026+ JS runtime).
+YouTube playlist / channel pages may also need **Deno 2.3+** or **Node.js 22+** on `PATH` (yt-dlp 2026+ JavaScript runtime). The app checks the detected version and falls back from an unsupported Deno to a supported Node.js.
 
 ### Developers
 
-- [Node.js](https://nodejs.org/) 20+ and [pnpm](https://pnpm.io/)
+- [Node.js](https://nodejs.org/) 22+ and [pnpm](https://pnpm.io/)
 - [Rust](https://rustup.rs/) (stable). Windows: Visual Studio C++ build tools. Linux: WebKitGTK 4.1 + `librsvg2-dev` + `patchelf`
 - Engines in `code/` (not committed):
 
@@ -92,10 +92,11 @@ The packaged app copies `code/yt-dlp` and `code/ffmpeg` as bundle resources. A m
 | Workflow | Trigger | What it does |
 |---|---|---|
 | [CI](.github/workflows/ci.yml) | PR and `main` | version check, `tsc`, `pnpm test`, `cargo fmt`, clippy, `cargo test` |
-| [Release](.github/workflows/release.yml) | `main`, tag `v*`, or manual | Windows + Linux (x64/arm64) + macOS (arm64/x64) → one GitHub Release |
+| [Stable dry run](.github/workflows/stable-dry-run.yml) | relevant PRs or manual | locked, five-platform installer build and validation; never publishes |
+| [Release](.github/workflows/release.yml) | `main`, tag `v*`, or manual | five platform jobs upload checked artifacts; one publisher validates the complete set and updates one GitHub Release |
 
 - Push to `main` updates the **nightly** prerelease only. It never deletes or overwrites a `vX.Y.Z` stable release.
-- Tag `v*` to publish an immutable **stable** release (GitHub Latest). Engines are pinned in `engines.lock.json` (sha256).
+- Tag `v*` to publish an immutable **stable** release. Stable engines and license texts are pinned in `engines.lock.json` by SHA-256; the release remains a draft until all five platform artifacts have been validated and uploaded.
 
 ```bash
 # bump version in package.json, src-tauri/Cargo.toml, src-tauri/tauri.conf.json
@@ -103,7 +104,7 @@ git tag v0.2.0
 git push origin v0.2.0
 ```
 
-CI downloads platform-native yt-dlp + ffmpeg into `code/` before `tauri build`. Installers are unsigned (Windows SmartScreen / macOS Gatekeeper may warn). To sign macOS builds, add `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, and related secrets to the repo, then pass them as `env` on the `tauri-action` step.
+CI downloads platform-native yt-dlp + ffmpeg into `code/` before `tauri build`. Installers are unsigned (Windows SmartScreen / macOS Gatekeeper may warn). To sign macOS builds, add `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, and related secrets to the repository, then expose them to the reusable build workflow's installer step.
 
 ---
 
@@ -147,4 +148,6 @@ This tool only wraps yt-dlp. Use it to download content you have the right to ob
 
 ## License
 
-No license file is attached yet. Treat the source as source-available until the author adds one.
+The yt-dlp GUI source is licensed under the [MIT License](LICENSE).
+
+Installers also bundle yt-dlp (Unlicense) and GPLv3 FFmpeg builds. Their source links, license texts, platform distributors, and pinned hashes are documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), `licenses/`, and `engines.lock.json`.

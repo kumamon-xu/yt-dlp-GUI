@@ -267,6 +267,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   buildTaskFromOptions: (url, extra) => {
     const o = get().options;
     const s = get().settings;
+    const proxy = o.proxy || s?.proxy || undefined;
     return {
       url,
       preset: resolveDownloadPreset(extra?.preset, o.preset, s?.defaultPreset || DEFAULT_PRESET),
@@ -275,7 +276,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       outTemplate: o.outTemplate || s?.outTemplate || undefined,
       concurrentFragments: o.concurrentFragments || s?.concurrentFragments || 4,
       limitRate: o.limitRate || s?.limitRate || undefined,
-      proxy: o.proxy || s?.proxy || undefined,
+      proxy,
+      proxySource: proxy ? "global" : "none",
       cookiesBrowser: o.cookiesBrowser || s?.cookiesBrowser || undefined,
       cookiesFile: o.cookiesFile || s?.cookiesFile || undefined,
       writeSubs: o.writeSubs,
@@ -307,11 +309,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => ({ tasks: [stub, ...s.tasks] }));
     try {
       await startTask(id, task);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      set((s) => ({
-        tasks: s.tasks.map((t) => (t.id === id ? { ...t, status: "failed", error: msg } : t)),
-      }));
+    } catch {
+      set((s) => ({ tasks: s.tasks.filter((t) => t.id !== id) }));
     }
   },
 
@@ -348,12 +347,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((st) => ({ tasks: [...stubs, ...st.tasks] }));
     try {
       await startTasks(items);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+    } catch {
       const ids = new Set(items.map((i) => i.id));
-      set((st) => ({
-        tasks: st.tasks.map((t) => (ids.has(t.id) ? { ...t, status: "failed", error: msg } : t)),
-      }));
+      set((st) => ({ tasks: st.tasks.filter((t) => !ids.has(t.id)) }));
     }
   },
 

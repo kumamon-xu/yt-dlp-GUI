@@ -25,23 +25,54 @@ function Get-Sha256([string]$Path) {
     (Get-FileHash -Algorithm SHA256 $Path).Hash.ToLowerInvariant()
 }
 
+function Assert-LicenseFile($ToolNode, [string]$ToolName) {
+    if (-not $ToolNode.licenseFile -or -not $ToolNode.licenseSha256) {
+        throw "missing license metadata for $ToolName"
+    }
+    $path = Join-Path $Root $ToolNode.licenseFile
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "missing license file: $path"
+    }
+    $got = Get-Sha256 $path
+    if ($got -ne $ToolNode.licenseSha256.ToLowerInvariant()) {
+        throw "$ToolName license hash mismatch: expected $($ToolNode.licenseSha256) got $got"
+    }
+}
+
 $useLock = -not $Latest
 if ($Lock) { $useLock = $true }
+
+$lock = $null
+if ($useLock) {
+    if (-not (Test-Path -LiteralPath $LockFile -PathType Leaf)) {
+        throw "missing lock file: $LockFile"
+    }
+    $lock = Get-Content $LockFile -Raw | ConvertFrom-Json
+    Assert-LicenseFile $lock.'yt-dlp' 'yt-dlp'
+    Assert-LicenseFile $lock.ffmpeg 'ffmpeg'
+}
 
 $Ytdlp = Join-Path $Code "yt-dlp.exe"
 $Ffmpeg = Join-Path $Code "ffmpeg.exe"
 
 if (-not $Force -and (Test-Path $Ytdlp) -and (Test-Path $Ffmpeg)) {
     if ((Get-Item $Ytdlp).Length -gt 1MB -and (Get-Item $Ffmpeg).Length -gt 1MB) {
-        Write-Host "engines already in $Code (pass -Force to re-download)"
-        & $Ytdlp --version
-        & $Ffmpeg -version | Select-Object -First 1
-        exit 0
+        $existingValid = $true
+        if ($useLock) {
+            $existingValid = (Get-Sha256 $Ytdlp) -eq $lock.'yt-dlp'.'windows-x64'.sha256.ToLowerInvariant() -and
+                (Get-Sha256 $Ffmpeg) -eq $lock.ffmpeg.'windows-x64'.sha256.ToLowerInvariant()
+            if (-not $existingValid) { Write-Host "existing engines do not match lock; re-downloading" }
+        }
+        if ($existingValid) {
+            Write-Host "engines already in $Code (pass -Force to re-download)"
+            & $Ytdlp --version
+            & $Ffmpeg -version | Select-Object -First 1
+            exit 0
+        }
     }
 }
 
 if ($useLock) {
-    $lock = Get-Content $LockFile -Raw | ConvertFrom-Json
     $yt = $lock.'yt-dlp'.'windows-x64'
     Invoke-Download $yt.url $Ytdlp
     $got = Get-Sha256 $Ytdlp

@@ -1,0 +1,174 @@
+name: Reusable release build
+
+on:
+  workflow_call:
+    inputs:
+      fetch_mode:
+        description: lock for reproducible stable builds; latest for nightly
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            slug: windows-x64
+            platform: windows-latest
+            args: ""
+            release_root: src-tauri/target/release
+            bundle_root: src-tauri/target/release/bundle
+            engine_arch: x64
+            rust_targets: ""
+          - name: Linux x64
+            slug: linux-x64
+            platform: ubuntu-22.04
+            args: ""
+            release_root: src-tauri/target/release
+            bundle_root: src-tauri/target/release/bundle
+            engine_arch: x64
+            rust_targets: ""
+          - name: Linux arm64
+            slug: linux-arm64
+            platform: ubuntu-22.04-arm
+            args: ""
+            release_root: src-tauri/target/release
+            bundle_root: src-tauri/target/release/bundle
+            engine_arch: arm64
+            rust_targets: ""
+          - name: macOS Apple Silicon
+            slug: macos-arm64
+            platform: macos-latest
+            args: "--target aarch64-apple-darwin"
+            release_root: src-tauri/target/aarch64-apple-darwin/release
+            bundle_root: src-tauri/target/aarch64-apple-darwin/release/bundle
+            engine_arch: arm64
+            rust_targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+          - name: macOS Intel
+            slug: macos-x64
+            platform: macos-latest
+            args: "--target x86_64-apple-darwin"
+            release_root: src-tauri/target/x86_64-apple-darwin/release
+            bundle_root: src-tauri/target/x86_64-apple-darwin/release/bundle
+            engine_arch: x64
+            rust_targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate fetch mode
+        shell: bash
+        run: |
+          case "${{ inputs.fetch_mode }}" in
+            lock|latest) ;;
+            *) echo "invalid fetch mode" >&2; exit 2 ;;
+          esac
+
+      - name: Linux Tauri deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils xz-utils
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+          components: rustfmt, clippy
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          prefix-key: ${{ matrix.platform }}-${{ matrix.engine_arch }}-${{ matrix.args }}
+
+      - name: Fetch locked/latest engines (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if ("${{ inputs.fetch_mode }}" -eq "lock") {
+            ./scripts/fetch-engines.ps1 -Force -Lock
+          } else {
+            ./scripts/fetch-engines.ps1 -Force -Latest
+          }
+
+      - name: Fetch locked/latest engines (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [ "${{ inputs.fetch_mode }}" = "lock" ]; then
+            bash scripts/fetch-engines.sh --force --lock --arch "${{ matrix.engine_arch }}"
+          else
+            bash scripts/fetch-engines.sh --force --latest --arch "${{ matrix.engine_arch }}"
+          fi
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck and frontend tests
+        run: |
+          pnpm exec tsc --noEmit
+          pnpm test
+
+      - name: Rust checks
+        run: |
+          cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Build installer
+        run: pnpm tauri build ${{ matrix.args }}
+
+      - name: Smoke bundled engines and legal files (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/check-bundled-engines.ps1 -Root "${{ matrix.release_root }}"
+
+      - name: Smoke bundled engines and legal files (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash scripts/check-bundled-engines.sh "${{ matrix.release_root }}"
+
+      - name: Collect installer and manifests
+        shell: bash
+        env:
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          if command -v python3 >/dev/null; then PY=python3; else PY=python; fi
+          VERSION=$("$PY" -c 'import json; print(json.load(open("package.json"))["version"])')
+          "$PY" scripts/collect-release-assets.py \
+            --bundle-root "${{ matrix.bundle_root }}" \
+            --platform "${{ matrix.slug }}" \
+            --version "$VERSION" \
+            --out release-upload
+          "$PY" scripts/write-engines-manifest.py \
+            --out "release-upload/engines-manifest-${{ matrix.slug }}.json" \
+            --os "${{ runner.os }}" \
+            --arch "${{ matrix.engine_arch }}" \
+            --mode "${{ inputs.fetch_mode }}" \
+            --label "${{ matrix.name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.slug }}
+          path: release-upload/
+          if-no-files-found: error
+          retention-days: 7

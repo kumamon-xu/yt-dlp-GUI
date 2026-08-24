@@ -566,8 +566,31 @@ pub fn apply_settings(task: &mut NewTask, s: &crate::config::GlobalSettings) {
     {
         task.cookies_browser = s.cookies_browser.clone();
     }
-    if task.proxy.as_ref().map(|x| x.is_empty()).unwrap_or(true) {
-        task.proxy = s.proxy.clone();
+    match task.proxy_source {
+        Some(ProxySource::Global) => task.proxy = s.proxy.clone(),
+        Some(ProxySource::Explicit) => {}
+        Some(ProxySource::None) => task.proxy = None,
+        None => {
+            let explicit = task
+                .proxy
+                .as_ref()
+                .map(|x| !x.trim().is_empty())
+                .unwrap_or(false);
+            if explicit {
+                task.proxy_source = Some(if task.proxy == s.proxy {
+                    ProxySource::Global
+                } else {
+                    ProxySource::Explicit
+                });
+            } else {
+                task.proxy = s.proxy.clone();
+                task.proxy_source = Some(if task.proxy.is_some() {
+                    ProxySource::Global
+                } else {
+                    ProxySource::None
+                });
+            }
+        }
     }
     if task
         .merge_format
@@ -611,6 +634,15 @@ pub enum TaskKind {
     Metadata,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ProxySource {
+    Global,
+    Explicit,
+    #[default]
+    None,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NewTask {
@@ -637,6 +669,8 @@ pub struct NewTask {
     pub cookies_file: Option<String>,
     #[serde(default)]
     pub proxy: Option<String>,
+    #[serde(default)]
+    pub proxy_source: Option<ProxySource>,
     #[serde(default)]
     pub embed_thumbnail: Option<bool>,
     #[serde(default)]
@@ -855,6 +889,7 @@ mod tests {
             cookies_browser: None,
             cookies_file: None,
             proxy: None,
+            proxy_source: None,
             embed_thumbnail: None,
             embed_metadata: None,
             write_subs: None,
@@ -961,6 +996,7 @@ mod tests {
             cookies_browser: None,
             cookies_file: None,
             proxy: None,
+            proxy_source: None,
             embed_thumbnail: None,
             embed_metadata: None,
             write_subs: None,
@@ -980,5 +1016,22 @@ mod tests {
         assert_eq!(cfg.merge_format, "mkv");
         let a = build_args(&cfg);
         assert_eq!(after(&a, "--merge-output-format"), "mkv");
+    }
+
+    #[test]
+    fn global_proxy_source_rehydrates_current_credentials() {
+        let mut task: NewTask = serde_json::from_value(serde_json::json!({
+            "url": "https://example.com",
+            "preset": "mp4",
+            "proxySource": "global"
+        }))
+        .unwrap();
+        let settings = crate::config::GlobalSettings {
+            proxy: Some("http://alice:secret@proxy.example:7890".into()),
+            ..Default::default()
+        };
+        apply_settings(&mut task, &settings);
+        assert_eq!(task.proxy, settings.proxy);
+        assert_eq!(task.proxy_source, Some(ProxySource::Global));
     }
 }

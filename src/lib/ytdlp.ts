@@ -77,6 +77,7 @@ export type TaskStatus =
   | "canceled";
 
 export type TaskKind = "video" | "audio" | "subtitles" | "thumbnail" | "metadata";
+export type ProxySource = "global" | "explicit" | "none";
 
 export interface NewTask {
   url: string;
@@ -91,6 +92,7 @@ export interface NewTask {
   cookiesBrowser?: string;
   cookiesFile?: string;
   proxy?: string;
+  proxySource?: ProxySource;
   embedThumbnail?: boolean;
   embedMetadata?: boolean;
   writeSubs?: boolean;
@@ -226,6 +228,22 @@ export function compressPlaylistItems(indices: number[]): string {
   return parts.join(",");
 }
 
+export function playlistIsTruncated(loadedCount: number, totalCount: number | null): boolean {
+  return totalCount == null || totalCount > loadedCount;
+}
+
+export function playlistItemsForSelection(
+  selected: number[],
+  loadedCount: number,
+  totalCount: number | null,
+): string | undefined {
+  const normalized = [...new Set(selected.filter((n) => Number.isInteger(n) && n >= 1 && n <= loadedCount))]
+    .sort((a, b) => a - b);
+  const fullyLoaded = totalCount != null && totalCount <= loadedCount;
+  if (fullyLoaded && normalized.length === loadedCount) return undefined;
+  return compressPlaylistItems(normalized);
+}
+
 export function redactUserinfo(s: string): string {
   const i = s.indexOf("://");
   if (i < 0) return s;
@@ -255,6 +273,7 @@ export function toolboxTask(
     writeInfoJson: kind === "metadata",
     outDir: net.outDir,
     proxy: net.proxy,
+    proxySource: net.proxy ? "global" : "none",
     cookiesBrowser: net.cookiesBrowser,
     cookiesFile: net.cookiesFile,
   };

@@ -1,0 +1,32 @@
+name: Stable release dry run
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/build-release.yml"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/stable-dry-run.yml"
+      - "engines.lock.json"
+      - "scripts/fetch-engines.*"
+      - "scripts/check-bundled-engines.*"
+      - "scripts/collect-release-assets.py"
+      - "scripts/prepare-release-assets.py"
+      - "scripts/write-engines-manifest.py"
+      - "src-tauri/tauri.*.conf.json"
+      - "THIRD_PARTY_NOTICES.md"
+      - "licenses/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stable-dry-run-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Locked five-platform build (no publish)
+    uses: ./.github/workflows/build-release.yml
+    with:
+      fetch_mode: lock

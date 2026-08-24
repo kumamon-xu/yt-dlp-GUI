@@ -39,6 +39,19 @@ def lock_url(lock: dict, tool: str, key: str) -> Optional[str]:
     node = (lock.get(tool) or {}).get(key) or {}
     return node.get("url")
 
+def lock_metadata(lock: dict, tool: str, key: str) -> dict:
+    tool_node = lock.get(tool) or {}
+    node = tool_node.get(key) or {}
+    return {
+        "locked_sha256": node.get("sha256"),
+        "license": node.get("license") or tool_node.get("license"),
+        "license_file": node.get("licenseFile") or tool_node.get("licenseFile"),
+        "license_url": node.get("licenseUrl") or tool_node.get("licenseUrl"),
+        "license_sha256": node.get("licenseSha256") or tool_node.get("licenseSha256"),
+        "license_notice_url": node.get("licenseNoticeUrl"),
+        "source_url": node.get("sourceUrl") or tool_node.get("sourceUrl"),
+    }
+
 def latest_url(os_name: str, arch: str, tool: str) -> Optional[str]:
     os_name = os_name.lower()
     if tool == "yt-dlp":
@@ -55,6 +68,23 @@ def latest_url(os_name: str, arch: str, tool: str) -> Optional[str]:
     if plat == "linux" or os_name.startswith("linux"):
         return f"https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-linux-{arch}"
     return f"https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-darwin-{arch}"
+
+def latest_metadata(os_name: str, tool: str) -> dict:
+    os_name = os_name.lower()
+    if tool == "yt-dlp":
+        return {
+            "source_url": "https://github.com/yt-dlp/yt-dlp/releases/latest",
+            "license_notice_url": "https://github.com/yt-dlp/yt-dlp/blob/master/LICENSE",
+        }
+    if os_name.startswith("win"):
+        return {
+            "source_url": "https://github.com/BtbN/FFmpeg-Builds",
+            "license_notice_url": "https://github.com/BtbN/FFmpeg-Builds#license",
+        }
+    return {
+        "source_url": "https://github.com/eugeneware/ffmpeg-static",
+        "license_notice_url": "https://github.com/eugeneware/ffmpeg-static/blob/master/LICENSE",
+    }
 
 def main():
     ap = argparse.ArgumentParser()
@@ -88,6 +118,9 @@ def main():
             "fetch_mode": args.mode,
             "version": first_line([str(p), "-version" if "ffmpeg" in n.lower() else "--version"]),
         }
+        entry.update(lock_metadata(lock, tool, key))
+        if args.mode == "latest":
+            entry.update(latest_metadata(args.os, tool))
         engines.append(entry)
     if not engines:
         print("no engine binaries under code/", file=sys.stderr)

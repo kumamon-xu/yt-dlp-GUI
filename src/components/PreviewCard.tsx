@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Download, Film, ListVideo, Loader2, RefreshCw } from "lucide-react";
 import { useAppStore, useT } from "../store";
 import { customFormatFromSelection, fmtDuration, formatOptions } from "../lib/format";
-import { compressPlaylistItems } from "../lib/ytdlp";
+import { playlistIsTruncated, playlistItemsForSelection } from "../lib/ytdlp";
 import type { VideoInfo } from "../lib/ytdlp";
 
 function Thumb({ url, className }: { url: string | null; className: string }) {
@@ -103,8 +103,9 @@ function PlaylistCard({ info }: { info: VideoInfo }) {
   const all = info.playlist ?? [];
   const allIdx = all.map((_, i) => i + 1);
   const selectedSet = new Set(selected);
-  const allSelected = allIdx.length > 0 && selected.length === allIdx.length;
-  const playlistItems = selected.length === all.length ? undefined : compressPlaylistItems(selected);
+  const allSelected = allIdx.length > 0 && allIdx.every((i) => selectedSet.has(i));
+  const truncated = playlistIsTruncated(all.length, info.playlistCount);
+  const playlistItems = playlistItemsForSelection(selected, all.length, info.playlistCount);
 
   return (
     <div className="flex flex-col gap-4">
@@ -118,7 +119,7 @@ function PlaylistCard({ info }: { info: VideoInfo }) {
         </div>
         <label className="flex cursor-pointer items-center gap-2 text-xs text-slate-300">
           <input type="checkbox" checked={allSelected} onChange={(e) => setAllItems(allIdx, e.target.checked)} className="accent-sky-500" />
-          {t("preview.selectAll")}（{selected.length}/{all.length}）
+          {truncated ? t("preview.selectLoaded") : t("preview.selectAll")}（{selected.length}/{all.length}）
         </label>
       </div>
       <div className="max-h-56 space-y-1 overflow-y-auto rounded-lg border border-slate-800 bg-slate-900/50 p-1.5">
@@ -151,7 +152,7 @@ function PlaylistCard({ info }: { info: VideoInfo }) {
           void startDownload(
             buildTask(previewUrl, {
               noPlaylist: false,
-              playlistItems: selected.length === all.length ? undefined : playlistItems,
+              playlistItems,
             }),
           )
         }

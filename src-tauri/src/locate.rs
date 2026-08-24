@@ -233,8 +233,13 @@ mod tests {
 
     #[test]
     fn release_workflow_never_deletes_stable() {
-        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows/release.yml");
-        let t = std::fs::read_to_string(&p).expect("release.yml");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows");
+        let release = std::fs::read_to_string(root.join("release.yml")).expect("release.yml");
+        let reusable =
+            std::fs::read_to_string(root.join("build-release.yml")).expect("build-release.yml");
+        let dry_run =
+            std::fs::read_to_string(root.join("stable-dry-run.yml")).expect("stable-dry-run.yml");
+        let t = format!("{release}\n{reusable}");
         assert!(
             !t.contains("gh release delete v"),
             "must never delete vX.Y.Z"
@@ -243,22 +248,27 @@ mod tests {
             !t.contains("gh release delete nightly"),
             "must not delete nightly before a successful matrix"
         );
-        assert!(t.contains("ref_name!=expect") || t.contains("tag"));
-        assert!(t.contains("pnpm test"));
-        assert!(t.contains("clippy"));
-        assert!(t.contains("-Lock") || t.contains("--lock"));
-        assert!(t.contains("check-bundled-engines"));
-        assert!(t.contains("prerelease:"));
-        assert!(t.contains("write-engines-manifest"));
-        assert!(t.contains("engines-manifest-"));
+        assert!(release.contains("ref_name!=expect"));
+        assert!(release.contains("needs: [verify-version, build]"));
+        assert!(release.contains("prepare-release-assets.py"));
+        assert!(release.contains("--draft=false"));
+        assert!(release.contains("gh release upload \"$RELEASE_TAG\" publish/* --clobber"));
+        assert!(reusable.contains("pnpm test"));
+        assert!(reusable.contains("clippy"));
+        assert!(reusable.contains("-Lock") && reusable.contains("--lock"));
+        assert!(reusable.contains("check-bundled-engines"));
+        assert!(reusable.contains("write-engines-manifest"));
+        assert!(reusable.contains("engines-manifest-${{ matrix.slug }}"));
         assert!(
-            t.contains("cargo test --manifest-path src-tauri/Cargo.toml --lib"),
+            reusable.contains("cargo test --manifest-path src-tauri/Cargo.toml --lib"),
             "Windows bin tests double-link VERSION resources"
         );
         assert!(
             !t.contains("engines-manifest.json --clobber || true"),
             "manifest upload must fail the job"
         );
+        assert!(dry_run.contains("fetch_mode: lock"));
+        assert!(!dry_run.contains("gh release"));
         let py = std::fs::read_to_string(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/write-engines-manifest.py"),
         )

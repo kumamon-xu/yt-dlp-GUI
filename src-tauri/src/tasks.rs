@@ -1,7 +1,8 @@
 //! 任务管理：并发队列、generation 所有权、杀进程树、进度事件
 
 use crate::command::{
-    apply_kind_constraints, apply_settings, build_args, needs_ffmpeg, NewTask, TaskKind,
+    apply_kind_constraints, apply_settings, build_args, needs_ffmpeg, NewTask, ProxySource,
+    TaskKind,
 };
 use crate::parser::{classify_error, parse_progress, FILE_PREFIX};
 use crate::{
@@ -124,6 +125,7 @@ pub struct TaskManager {
     pub tasks: Mutex<HashMap<String, Arc<TaskInner>>>,
     pub order: Mutex<Vec<String>>,
     pub tombstones: Mutex<HashSet<String>>,
+    persist_mu: Mutex<()>,
 }
 
 impl Default for TaskManager {
@@ -132,6 +134,7 @@ impl Default for TaskManager {
             tasks: Mutex::new(HashMap::new()),
             order: Mutex::new(Vec::new()),
             tombstones: Mutex::new(HashSet::new()),
+            persist_mu: Mutex::new(()),
         }
     }
 }
@@ -229,9 +232,22 @@ pub fn remove_id(mgr: &TaskManager, id: &str) -> Option<Arc<TaskInner>> {
     inner
 }
 
-fn strip_task_secrets(mut p: TaskPayload) -> TaskPayload {
-    if let Some(ref proxy) = p.request.proxy {
-        p.request.proxy = Some(crate::redact::strip_userinfo(proxy));
+fn prepare_task_for_queue(mut p: TaskPayload) -> TaskPayload {
+    match p.request.proxy_source.unwrap_or(ProxySource::None) {
+        ProxySource::Global | ProxySource::None => {
+            p.request.proxy = None;
+        }
+        ProxySource::Explicit => {
+            if let Some(ref proxy) = p.request.proxy {
+                let stripped = crate::redact::strip_userinfo(proxy);
+                if stripped != *proxy {
+                    p.request.proxy = None;
+                    p.status = TaskStatus::Paused;
+                    p.error_code = Some("PROXY_CREDENTIALS_REQUIRED".into());
+                    p.error = Some("任务使用了独立认证 Proxy；重启后请重新创建任务".into());
+                }
+            }
+        }
     }
     p
 }
@@ -246,12 +262,12 @@ pub fn queue_snapshot(mgr: &TaskManager) -> QueueFile {
         }
         if let Some(t) = map.get(id) {
             snaps.push(TaskSnapshot {
-                payload: strip_task_secrets(t.payload.lock().unwrap().clone()),
+                payload: prepare_task_for_queue(t.payload.lock().unwrap().clone()),
             });
         }
     }
     QueueFile {
-        schema_version: 1,
+        schema_version: 2,
         tasks: snaps,
     }
 }
@@ -308,6 +324,10 @@ pub fn apply_child_exit(inner: &TaskInner, gen: u64, success: bool) -> bool {
 fn persist(app: &AppHandle) -> Result<(), String> {
     let mgr = app.state::<TaskManager>();
     let path = crate::config::queue_path(app)?;
+    let _txn = mgr
+        .persist_mu
+        .lock()
+        .map_err(|_| "queue persist lock poisoned".to_string())?;
     persist_queue_to(&path, mgr.inner())
 }
 
@@ -317,11 +337,35 @@ fn persist_ok(app: &AppHandle) {
     }
 }
 
-fn parse_queue_text(text: &str) -> Vec<TaskSnapshot> {
+fn parse_queue_text(text: &str) -> (u32, Vec<TaskSnapshot>) {
     if let Ok(file) = serde_json::from_str::<QueueFile>(text) {
-        return file.tasks;
+        return (file.schema_version, file.tasks);
     }
-    serde_json::from_str::<Vec<TaskSnapshot>>(text).unwrap_or_default()
+    (
+        0,
+        serde_json::from_str::<Vec<TaskSnapshot>>(text).unwrap_or_default(),
+    )
+}
+
+fn migrate_proxy_source(schema_version: u32, p: &mut TaskPayload) {
+    if schema_version < 2 {
+        let had_proxy = p
+            .request
+            .proxy
+            .as_ref()
+            .map(|x| !x.trim().is_empty())
+            .unwrap_or(false);
+        p.request.proxy = None;
+        p.request.proxy_source = Some(if had_proxy {
+            ProxySource::Global
+        } else {
+            ProxySource::None
+        });
+        return;
+    }
+    if matches!(p.request.proxy_source, Some(ProxySource::Global)) {
+        p.request.proxy = None;
+    }
 }
 
 pub fn restore_queue(app: &AppHandle) {
@@ -331,11 +375,12 @@ pub fn restore_queue(app: &AppHandle) {
     let Ok(text) = std::fs::read_to_string(&path) else {
         return;
     };
-    let snaps = parse_queue_text(&text);
+    let (schema_version, snaps) = parse_queue_text(&text);
     let mgr = app.state::<TaskManager>();
     let (mut map, mut order) = lock_maps(mgr.inner());
     for snap in snaps {
         let mut p = snap.payload;
+        migrate_proxy_source(schema_version, &mut p);
         if p.status.is_live() {
             p.status = TaskStatus::Paused;
             p.speed = 0.0;
@@ -725,24 +770,9 @@ fn empty_payload(id: String, task: NewTask) -> TaskPayload {
     }
 }
 
-#[tauri::command]
-pub async fn start_task(
-    app: AppHandle,
-    state: State<'_, TaskManager>,
-    id: String,
-    mut task: NewTask,
-) -> Result<(), String> {
-    if state.tasks.lock().unwrap().contains_key(&id) {
-        return Err("任务已存在".into());
-    }
-    crate::validate::validate_concurrent_fragments(task.concurrent_fragments.unwrap_or(4))?;
-    crate::validate::validate_limit_rate(task.limit_rate.as_deref())?;
-    crate::validate::validate_proxy(task.proxy.as_deref())?;
-    crate::validate::validate_playlist_items(task.playlist_items.as_deref())?;
-    let settings = settings_snapshot(&app);
-    apply_settings(&mut task, &settings);
-    let inner = Arc::new(TaskInner {
-        payload: Mutex::new(empty_payload(id.clone(), task)),
+fn new_task_inner(id: String, task: NewTask) -> Arc<TaskInner> {
+    Arc::new(TaskInner {
+        payload: Mutex::new(empty_payload(id, task)),
         child: Mutex::new(None),
         pid: AtomicU32::new(0),
         run_generation: AtomicU64::new(0),
@@ -750,14 +780,65 @@ pub async fn start_task(
         stderr_tail: Mutex::new(VecDeque::new()),
         canceled: AtomicBool::new(false),
         args: Mutex::new(Vec::new()),
-    });
-    {
-        let (mut map, mut order) = lock_maps(state.inner());
-        map.insert(id.clone(), Arc::clone(&inner));
-        order.insert(0, id);
+    })
+}
+
+fn insert_and_persist_to(
+    path: &Path,
+    mgr: &TaskManager,
+    entries: Vec<(String, Arc<TaskInner>)>,
+) -> Result<Vec<Arc<TaskInner>>, String> {
+    let _txn = mgr
+        .persist_mu
+        .lock()
+        .map_err(|_| "queue persist lock poisoned".to_string())?;
+    let ids: Vec<String> = entries.iter().map(|(id, _)| id.clone()).collect();
+    let id_set: HashSet<String> = ids.iter().cloned().collect();
+    if id_set.len() != ids.len() {
+        return Err("批量任务 ID 重复".into());
     }
+    {
+        let (mut map, mut order) = lock_maps(mgr);
+        let stones = mgr.tombstones.lock().unwrap();
+        if let Some(id) = ids
+            .iter()
+            .find(|id| map.contains_key(*id) || stones.contains(*id))
+        {
+            return Err(format!("任务已存在: {id}"));
+        }
+        for (id, inner) in &entries {
+            map.insert(id.clone(), Arc::clone(inner));
+            order.insert(0, id.clone());
+        }
+    }
+    if let Err(e) = persist_queue_to(path, mgr) {
+        let (mut map, mut order) = lock_maps(mgr);
+        for id in &ids {
+            map.remove(id);
+        }
+        order.retain(|id| !id_set.contains(id));
+        return Err(e);
+    }
+    Ok(entries.into_iter().map(|(_, inner)| inner).collect())
+}
+
+#[tauri::command]
+pub async fn start_task(
+    app: AppHandle,
+    state: State<'_, TaskManager>,
+    id: String,
+    mut task: NewTask,
+) -> Result<(), String> {
+    crate::validate::validate_concurrent_fragments(task.concurrent_fragments.unwrap_or(4))?;
+    crate::validate::validate_limit_rate(task.limit_rate.as_deref())?;
+    crate::validate::validate_proxy(task.proxy.as_deref())?;
+    crate::validate::validate_playlist_items(task.playlist_items.as_deref())?;
+    let settings = settings_snapshot(&app);
+    apply_settings(&mut task, &settings);
+    let inner = new_task_inner(id.clone(), task);
+    let path = crate::config::queue_path(&app)?;
+    insert_and_persist_to(&path, state.inner(), vec![(id, Arc::clone(&inner))])?;
     emit_payload(&app, &inner);
-    persist(&app)?;
     pump_queue(app);
     Ok(())
 }
@@ -774,37 +855,31 @@ pub async fn start_tasks(
     state: State<'_, TaskManager>,
     items: Vec<StartItem>,
 ) -> Result<(), String> {
+    let mut seen = HashSet::new();
     for it in &items {
+        if !seen.insert(it.id.clone()) {
+            return Err(format!("批量任务 ID 重复: {}", it.id));
+        }
         crate::validate::validate_concurrent_fragments(it.task.concurrent_fragments.unwrap_or(4))?;
         crate::validate::validate_limit_rate(it.task.limit_rate.as_deref())?;
         crate::validate::validate_proxy(it.task.proxy.as_deref())?;
         crate::validate::validate_playlist_items(it.task.playlist_items.as_deref())?;
     }
     let settings = settings_snapshot(&app);
-    {
-        let (mut map, mut order) = lock_maps(state.inner());
-        for it in items {
-            if map.contains_key(&it.id) {
-                continue;
-            }
+    let entries: Vec<_> = items
+        .into_iter()
+        .map(|it| {
             let mut task = it.task;
             apply_settings(&mut task, &settings);
-            let inner = Arc::new(TaskInner {
-                payload: Mutex::new(empty_payload(it.id.clone(), task)),
-                child: Mutex::new(None),
-                pid: AtomicU32::new(0),
-                run_generation: AtomicU64::new(0),
-                run_mu: Mutex::new(()),
-                stderr_tail: Mutex::new(VecDeque::new()),
-                canceled: AtomicBool::new(false),
-                args: Mutex::new(Vec::new()),
-            });
-            map.insert(it.id.clone(), Arc::clone(&inner));
-            order.insert(0, it.id);
-            emit_payload(&app, &inner);
-        }
+            let inner = new_task_inner(it.id.clone(), task);
+            (it.id, inner)
+        })
+        .collect();
+    let path = crate::config::queue_path(&app)?;
+    let inserted = insert_and_persist_to(&path, state.inner(), entries)?;
+    for inner in inserted {
+        emit_payload(&app, &inner);
     }
-    persist(&app)?;
     pump_queue(app);
     Ok(())
 }
@@ -979,6 +1054,7 @@ impl NewTask {
             cookies_browser: None,
             cookies_file: None,
             proxy: None,
+            proxy_source: None,
             embed_thumbnail: None,
             embed_metadata: None,
             write_subs: None,
@@ -1131,7 +1207,8 @@ mod tests {
     #[test]
     fn parse_queue_v1_and_legacy_array() {
         let legacy = r#"[{"payload":{"id":"a","url":"u","title":null,"status":"downloading","downloaded":0,"total":0,"speed":0,"eta":0,"filePath":null,"error":null,"request":{"url":"u","preset":"mp4"}}}]"#;
-        let snaps = parse_queue_text(legacy);
+        let (schema, snaps) = parse_queue_text(legacy);
+        assert_eq!(schema, 0);
         assert_eq!(snaps.len(), 1);
         let mut p = snaps[0].payload.clone();
         if p.status.is_live() {
@@ -1139,7 +1216,9 @@ mod tests {
         }
         assert_eq!(p.status, TaskStatus::Paused);
         let v1 = r#"{"schemaVersion":1,"tasks":[]}"#;
-        assert!(parse_queue_text(v1).is_empty());
+        let (schema, snaps) = parse_queue_text(v1);
+        assert_eq!(schema, 1);
+        assert!(snaps.is_empty());
     }
 
     #[test]
@@ -1212,6 +1291,45 @@ fn main() {{
         exe
     }
 
+    fn compile_blocking_fake(dir: &Path, name: &str, release: &Path) -> PathBuf {
+        let src = dir.join(format!("{name}.rs"));
+        let release_literal = format!("{:?}", release.to_string_lossy());
+        std::fs::write(
+            &src,
+            format!(
+                r#"
+fn main() {{
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--version") {{
+        println!("yt-dlp 0.0-fake");
+        return;
+    }}
+    println!("YDLP|downloading|10|100|1|1|t");
+    let release = std::path::Path::new({release_literal});
+    while !release.exists() {{
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }}
+    println!("YDLPFILE|/tmp/out.mp4");
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let exe = dir.join(if cfg!(windows) {
+            format!("{name}.exe")
+        } else {
+            name.to_string()
+        });
+        let st = std::process::Command::new(rustc_bin())
+            .arg(&src)
+            .arg("-o")
+            .arg(&exe)
+            .status()
+            .expect("rustc");
+        assert!(st.success(), "rustc blocking fake engine");
+        exe
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fake_process_stale_wait_does_not_clobber() {
         let dir = std::env::temp_dir().join(format!(
@@ -1250,7 +1368,8 @@ fn main() {{
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let engine = compile_fake(&dir, "cap", 250);
+        let release = dir.join("release-children");
+        let engine = compile_blocking_fake(&dir, "cap", &release);
         let mgr = TaskManager::default();
         for i in 0..6 {
             enqueue(&mgr, make_inner(&format!("c{i}"), "https://example.com"));
@@ -1277,15 +1396,25 @@ fn main() {{
             assert_eq!(live, 2);
             assert_eq!(queued, 4);
         }
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-        let live2 = mgr
-            .tasks
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|t| t.payload.lock().unwrap().status.is_live())
-            .count();
-        assert!(live2 <= 2, "never more than cap live, got {live2}");
+        std::fs::write(&release, b"go").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let live = mgr
+                .tasks
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|t| t.payload.lock().unwrap().status.is_live())
+                .count();
+            if live == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "children did not exit"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1536,16 +1665,81 @@ fn main() {{
     }
 
     #[test]
-    fn queue_snapshot_strips_proxy_password() {
+    fn queue_snapshot_references_global_proxy_without_credentials() {
         let mgr = TaskManager::default();
         let inner = make_inner("s", "https://example.com");
-        inner.payload.lock().unwrap().request.proxy =
-            Some("http://alice:secret@127.0.0.1:7890".into());
+        {
+            let mut p = inner.payload.lock().unwrap();
+            p.request.proxy = Some("http://alice:secret@127.0.0.1:7890".into());
+            p.request.proxy_source = Some(ProxySource::Global);
+        }
         enqueue(&mgr, inner);
         let snap = queue_snapshot(&mgr);
-        let proxy = snap.tasks[0].payload.request.proxy.clone().unwrap();
-        assert!(!proxy.contains("secret"), "{proxy}");
-        assert_eq!(proxy, "http://127.0.0.1:7890");
+        assert_eq!(snap.schema_version, 2);
+        assert!(snap.tasks[0].payload.request.proxy.is_none());
+        assert_eq!(
+            snap.tasks[0].payload.request.proxy_source,
+            Some(ProxySource::Global)
+        );
+    }
+
+    #[test]
+    fn authenticated_explicit_proxy_is_not_persisted_as_a_broken_url() {
+        let inner = make_inner("explicit", "https://example.com");
+        {
+            let mut p = inner.payload.lock().unwrap();
+            p.request.proxy = Some("http://alice:secret@proxy.example:7890".into());
+            p.request.proxy_source = Some(ProxySource::Explicit);
+        }
+        let persisted = prepare_task_for_queue(inner.payload.lock().unwrap().clone());
+        assert!(persisted.request.proxy.is_none());
+        assert_eq!(persisted.status, TaskStatus::Paused);
+        assert_eq!(
+            persisted.error_code.as_deref(),
+            Some("PROXY_CREDENTIALS_REQUIRED")
+        );
+        assert!(!serde_json::to_string(&persisted)
+            .unwrap()
+            .contains("secret"));
+    }
+
+    #[test]
+    fn queue_v1_proxy_migrates_to_global_source() {
+        let inner = make_inner("s", "https://example.com");
+        let mut p = inner.payload.lock().unwrap().clone();
+        p.request.proxy = Some("http://proxy.example:7890".into());
+        p.request.proxy_source = None;
+        migrate_proxy_source(1, &mut p);
+        assert!(p.request.proxy.is_none());
+        assert_eq!(p.request.proxy_source, Some(ProxySource::Global));
+    }
+
+    #[test]
+    fn failed_start_persist_rolls_back_all_inserted_tasks() {
+        let dir = std::env::temp_dir().join(format!(
+            "ytdlp-start-rollback-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"x").unwrap();
+        let path = blocker.join("queue.json");
+        let mgr = TaskManager::default();
+        let first = new_task_inner("rollback-1".into(), NewTask::test_default());
+        let second = new_task_inner("rollback-2".into(), NewTask::test_default());
+        let err = insert_and_persist_to(
+            &path,
+            &mgr,
+            vec![("rollback-1".into(), first), ("rollback-2".into(), second)],
+        );
+        assert!(err.is_err());
+        assert!(mgr.tasks.lock().unwrap().is_empty());
+        assert!(mgr.order.lock().unwrap().is_empty());
+        assert!(claim_next(&mgr, 2).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

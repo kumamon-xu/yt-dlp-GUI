@@ -13,3 +13,11 @@ foreach ($f in @($yt, $ff)) {
 if ($LASTEXITCODE -ne 0) { throw "yt-dlp --version failed ($LASTEXITCODE): $($yt.FullName)" }
 & $ff.FullName -version
 if ($LASTEXITCODE -ne 0) { throw "ffmpeg -version failed ($LASTEXITCODE): $($ff.FullName)" }
+
+foreach ($name in @("THIRD_PARTY_NOTICES.md", "FFmpeg-GPL-3.0.txt", "yt-dlp-Unlicense.txt")) {
+    $legal = Get-ChildItem -Path $Root -Recurse -File -Filter $name -ErrorAction SilentlyContinue |
+        Where-Object { $_.DirectoryName -match "[\\/]licenses([\\/]|$)" } |
+        Select-Object -First 1
+    if (-not $legal -or $legal.Length -eq 0) { throw "bundled legal file missing: $name" }
+    Write-Host "ok $($legal.FullName) $($legal.Length)"
+}

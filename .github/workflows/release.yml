@@ -5,9 +5,7 @@ on:
     branches: [main]
     tags: ["v*"]
     paths-ignore:
-      - "**.md"
-      - ".gitignore"
-      - "LICENSE"
+      - "docs/**"
   workflow_dispatch:
 
 permissions:
@@ -16,9 +14,6 @@ permissions:
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: ${{ github.ref_type != 'tag' }}
-
-env:
-  CARGO_TERM_COLOR: always
 
 jobs:
   verify-version:
@@ -33,161 +28,86 @@ jobs:
           pkg=json.load(open("package.json"))["version"]
           tauri=json.load(open("src-tauri/tauri.conf.json"))["version"]
           cargo=re.search(r'^version = "([^"]+)"', pathlib.Path("src-tauri/Cargo.toml").read_text(), re.M).group(1)
-          print(pkg, cargo, tauri)
           if not (pkg==cargo==tauri):
-              sys.exit("version mismatch")
-          ref_type=os.environ.get("GITHUB_REF_TYPE","")
-          ref_name=os.environ.get("GITHUB_REF_NAME","")
-          if ref_type=="tag":
+              sys.exit(f"version mismatch: {pkg} {cargo} {tauri}")
+          if os.environ.get("GITHUB_REF_TYPE") == "tag":
               expect="v"+pkg
+              ref_name=os.environ.get("GITHUB_REF_NAME", "")
               if ref_name!=expect:
                   sys.exit(f"tag {ref_name} != {expect}")
           PY
 
-  release:
-    name: ${{ matrix.name }}
-    needs: [verify-version]
+  build:
+    name: Build and validate all platforms
+    needs: verify-version
     permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows x64
-            platform: windows-latest
-            args: ""
-            engine_arch: x64
-            rust_targets: ""
-          - name: Linux x64
-            platform: ubuntu-22.04
-            args: ""
-            engine_arch: x64
-            rust_targets: ""
-          - name: Linux arm64
-            platform: ubuntu-22.04-arm
-            args: ""
-            engine_arch: arm64
-            rust_targets: ""
-          - name: macOS Apple Silicon
-            platform: macos-latest
-            args: "--target aarch64-apple-darwin"
-            engine_arch: arm64
-            rust_targets: "aarch64-apple-darwin,x86_64-apple-darwin"
-          - name: macOS Intel
-            platform: macos-latest
-            args: "--target x86_64-apple-darwin"
-            engine_arch: x64
-            rust_targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+      contents: read
+    uses: ./.github/workflows/build-release.yml
+    with:
+      fetch_mode: ${{ github.ref_type == 'tag' && 'lock' || 'latest' }}
 
-    runs-on: ${{ matrix.platform }}
-    timeout-minutes: 75
+  publish:
+    name: Publish one complete release
+    needs: [verify-version, build]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Linux Tauri deps
-        if: runner.os == 'Linux'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: downloaded-artifacts
+
+      - name: Validate and flatten all release assets
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils xz-utils
+          python3 scripts/prepare-release-assets.py \
+            --artifacts-root downloaded-artifacts \
+            --project-root . \
+            --fetch-mode "${{ github.ref_type == 'tag' && 'lock' || 'latest' }}" \
+            --out publish
 
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 9
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: pnpm
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust_targets }}
-          components: rustfmt, clippy
-
-      - uses: swatinem/rust-cache@v2
-        with:
-          workspaces: "./src-tauri -> target"
-          prefix-key: ${{ matrix.platform }}-${{ matrix.engine_arch }}-${{ matrix.args }}
-
-      - name: Fetch engines (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          if ("${{ github.ref_type }}" -eq "tag") { ./scripts/fetch-engines.ps1 -Force -Lock }
-          else { ./scripts/fetch-engines.ps1 -Force -Latest }
-
-      - name: Fetch engines (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            bash scripts/fetch-engines.sh --force --lock --arch ${{ matrix.engine_arch }}
-          else
-            bash scripts/fetch-engines.sh --force --latest --arch ${{ matrix.engine_arch }}
-          fi
-
-      - name: Install frontend deps
-        run: pnpm install --frozen-lockfile
-
-      - name: Typecheck
-        run: pnpm exec tsc --noEmit
-
-      - name: Frontend tests
-        run: pnpm test
-
-      - name: Cargo fmt
-        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
-
-      - name: Clippy
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-
-      - name: Cargo test
-        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
-
-      - name: Build (for smoke)
-        run: pnpm tauri build ${{ matrix.args }}
-
-      - name: Smoke bundled engines (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./scripts/check-bundled-engines.ps1 -Root src-tauri/target
-
-      - name: Smoke bundled engines (Unix)
-        if: runner.os != 'Windows'
-        run: bash scripts/check-bundled-engines.sh src-tauri/target
-
-      - name: Publish
-        uses: tauri-apps/tauri-action@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tauriScript: pnpm tauri
-          args: ${{ matrix.args }}
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'nightly' }}
-          releaseName: ${{ github.ref_type == 'tag' && format('yt-dlp GUI {0}', github.ref_name) || 'yt-dlp GUI nightly' }}
-          releaseBody: |
-            Installers with bundled **yt-dlp** and **ffmpeg**.
-            安装包已内置 yt-dlp 与 ffmpeg。
-
-            Stable = git tag `v*`. Nightly = `main` (prerelease, rolling).
-            稳定版仅由版本 tag 产生，不会被后续 main 覆盖。
-          releaseDraft: false
-          prerelease: ${{ github.ref_type != 'tag' }}
-          generateReleaseNotes: true
-          uploadUpdaterJson: false
-          uploadUpdaterSignatures: false
-          retryAttempts: 2
-
-      - name: Engines manifest
-        shell: bash
+      - name: Publish stable or rolling nightly
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RUNNER_OS: ${{ runner.os }}
+          IS_STABLE: ${{ github.ref_type == 'tag' }}
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || 'nightly' }}
         run: |
-          MODE=lock
-          if [ "${{ github.ref_type }}" != "tag" ]; then MODE=latest; fi
-          SLUG=$(echo "${{ matrix.name }}" | tr ' ' '-')
-          OUT="engines-manifest-${SLUG}.json"
-          if command -v python3 >/dev/null; then PY=python3; else PY=python; fi
-          "$PY" scripts/write-engines-manifest.py --out "$OUT" --os "${{ runner.os }}" --arch "${{ matrix.engine_arch }}" --mode "$MODE" --label "${{ matrix.name }}"
-          TAG="${{ github.ref_type == 'tag' && github.ref_name || 'nightly' }}"
-          gh release upload "$TAG" "$OUT" --clobber
+          set -euo pipefail
+          existing=""
+          if gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft >release-state.txt 2>/dev/null; then
+            existing=$(cat release-state.txt)
+          fi
+          prune_stale_assets() {
+            while IFS= read -r asset; do
+              if [ -n "$asset" ] && [ ! -f "publish/$asset" ]; then
+                gh release delete-asset "$RELEASE_TAG" "$asset" --yes
+              fi
+            done < <(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')
+          }
+
+          if [ "$IS_STABLE" = "true" ]; then
+            if [ "$existing" = "false" ]; then
+              echo "stable release already published: $RELEASE_TAG" >&2
+              exit 1
+            fi
+            if [ -z "$existing" ]; then
+              gh release create "$RELEASE_TAG" --draft --verify-tag --generate-notes \
+                --title "yt-dlp GUI $RELEASE_TAG"
+            fi
+            gh release upload "$RELEASE_TAG" publish/* --clobber
+            prune_stale_assets
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease=false
+          else
+            if [ -z "$existing" ]; then
+              gh release create nightly --draft --prerelease --target "$GITHUB_SHA" \
+                --title "yt-dlp GUI nightly" \
+                --notes "Rolling main-branch build. Installers bundle yt-dlp and FFmpeg."
+            fi
+            gh release upload nightly publish/* --clobber
+            prune_stale_assets
+            gh release edit nightly --draft=false --prerelease=true \
+              --target "$GITHUB_SHA" --title "yt-dlp GUI nightly"
+          fi

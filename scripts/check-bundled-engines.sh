@@ -35,4 +35,13 @@ if [[ "$found_yt" -eq 0 || "$found_ff" -eq 0 ]]; then
   echo "need both $NAME_YT and $NAME_FF under $ROOT/**/code/ (yt=$found_yt ff=$found_ff)" >&2
   exit 1
 fi
+
+for name in THIRD_PARTY_NOTICES.md FFmpeg-GPL-3.0.txt yt-dlp-Unlicense.txt; do
+  legal=$(find "$ROOT" -type f -name "$name" -path "*/licenses/*" -print -quit 2>/dev/null)
+  if [[ -z "$legal" || ! -s "$legal" ]]; then
+    echo "bundled legal file missing: $name" >&2
+    exit 1
+  fi
+  echo "found $legal ($(wc -c < "$legal") bytes)"
+done
 echo "bundled engines ok"

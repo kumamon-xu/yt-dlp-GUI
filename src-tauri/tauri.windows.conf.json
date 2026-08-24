@@ -3,7 +3,10 @@
   "bundle": {
     "resources": {
       "../code/yt-dlp.exe": "code/yt-dlp.exe",
-      "../code/ffmpeg.exe": "code/ffmpeg.exe"
+      "../code/ffmpeg.exe": "code/ffmpeg.exe",
+      "../THIRD_PARTY_NOTICES.md": "licenses/THIRD_PARTY_NOTICES.md",
+      "../licenses/FFmpeg-GPL-3.0.txt": "licenses/FFmpeg-GPL-3.0.txt",
+      "../licenses/yt-dlp-Unlicense.txt": "licenses/yt-dlp-Unlicense.txt"
     }
   }
 }

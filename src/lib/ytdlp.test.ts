@@ -5,6 +5,8 @@ import {
   canRemoveStatus,
   compressPlaylistItems,
   isCurrentToken,
+  playlistIsTruncated,
+  playlistItemsForSelection,
   redactUserinfo,
   resolveDownloadPreset,
   retryTaskRequest,
@@ -107,6 +109,26 @@ describe("compressPlaylistItems", () => {
   });
 });
 
+describe("playlistItemsForSelection", () => {
+  const firstThousand = Array.from({ length: 1000 }, (_, i) => i + 1);
+
+  it("keeps an explicit range when preview is truncated", () => {
+    expect(playlistIsTruncated(1000, 5000)).toBe(true);
+    expect(playlistItemsForSelection(firstThousand, 1000, 5000)).toBe("1-1000");
+  });
+
+  it("keeps an explicit range when total is unknown", () => {
+    expect(playlistIsTruncated(1000, null)).toBe(true);
+    expect(playlistItemsForSelection(firstThousand, 1000, null)).toBe("1-1000");
+  });
+
+  it("omits the range only when the complete playlist is selected", () => {
+    expect(playlistIsTruncated(1000, 1000)).toBe(false);
+    expect(playlistItemsForSelection(firstThousand, 1000, 1000)).toBeUndefined();
+    expect(playlistItemsForSelection([1, 2, 5], 1000, 5000)).toBe("1-2,5");
+  });
+});
+
 describe("redactUserinfo", () => {
   it("masks proxy password", () => {
     expect(redactUserinfo("http://alice:secret@127.0.0.1:7890")).toBe("http://alice:***@127.0.0.1:7890");
@@ -120,5 +142,6 @@ describe("toolboxTask", () => {
     expect(t.writeInfoJson).toBe(true);
     expect(t.writeSubs).toBe(false);
     expect(t.sponsorblock).toBeUndefined();
+    expect(t.proxySource).toBe("global");
   });
 });

@@ -82,16 +82,103 @@ pub(crate) fn find_ffmpeg(override_path: Option<&str>) -> Result<PathBuf, String
 }
 
 pub(crate) fn js_runtime_arg() -> Option<String> {
+    resolve_supported_js_runtime()
+        .ok()
+        .map(|r| format!("{}:{}", r.name, r.path.to_string_lossy()))
+}
+
+const DENO_MIN_VERSION: (u64, u64, u64) = (2, 3, 0);
+const NODE_MIN_VERSION: (u64, u64, u64) = (22, 0, 0);
+
+#[derive(Debug, Clone)]
+struct SupportedJsRuntime {
+    name: &'static str,
+    path: PathBuf,
+    source: locate::ToolSource,
+    version: String,
+}
+
+fn parse_numeric_version(raw: &str) -> Option<(u64, u64, u64)> {
+    let start = raw.find(|c: char| c.is_ascii_digit())?;
+    let token: String = raw[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let mut parts = token.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
+}
+
+fn validate_runtime_version(name: &str, version: &str) -> Result<(), String> {
+    let minimum = match name {
+        "deno" => DENO_MIN_VERSION,
+        "node" => NODE_MIN_VERSION,
+        _ => return Err(format!("未知 JS 运行时: {name}")),
+    };
+    match parse_numeric_version(version) {
+        Some(actual) if actual >= minimum => Ok(()),
+        Some(actual) => Err(format!(
+            "{name} {}.{}.{} 版本过低，需要 >= {}.{}.{}",
+            actual.0, actual.1, actual.2, minimum.0, minimum.1, minimum.2
+        )),
+        None => Err(format!("无法解析 {name} 版本: {version}")),
+    }
+}
+
+fn probe_runtime_version(path: &Path) -> Result<String, String> {
+    let mut cmd = std::process::Command::new(path);
+    no_window_std(&mut cmd);
+    let out = cmd
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if !out.status.success() {
+        return Err(format!("{} --version failed", path.display()));
+    }
+    let line = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if line.is_empty() {
+        return Err(format!("{} --version returned no version", path.display()));
+    }
+    Ok(line)
+}
+
+fn resolve_supported_js_runtime() -> Result<SupportedJsRuntime, String> {
     let path_only = locate::ToolLookup {
         allow_path: true,
         ..Default::default()
     };
-    if locate::locate_tool("deno", None, &path_only).is_ok() {
-        return None;
+    let mut issues = Vec::new();
+    for name in ["deno", "node"] {
+        let Ok((path, source)) = locate::locate_tool(name, None, &path_only) else {
+            continue;
+        };
+        match probe_runtime_version(&path) {
+            Ok(version) => match validate_runtime_version(name, &version) {
+                Ok(()) => {
+                    return Ok(SupportedJsRuntime {
+                        name,
+                        path,
+                        source,
+                        version,
+                    });
+                }
+                Err(issue) => issues.push(issue),
+            },
+            Err(e) => issues.push(e),
+        }
     }
-    locate::locate_tool("node", None, &path_only)
-        .ok()
-        .map(|(p, _)| format!("node:{}", p.to_string_lossy()))
+    if issues.is_empty() {
+        Err("未找到受支持的 JS 运行时（Deno >= 2.3 或 Node >= 22）".into())
+    } else {
+        Err(issues.join("；"))
+    }
 }
 
 pub(crate) fn kill_process_tree(pid: u32) {
@@ -118,8 +205,7 @@ pub(crate) fn kill_process_tree_grace(pid: u32, grace: std::time::Duration) {
         if !grace.is_zero() {
             let deadline = std::time::Instant::now() + grace;
             while std::time::Instant::now() < deadline {
-                let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
-                if !alive {
+                if !process_group_exists(pid) {
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(40));
@@ -129,6 +215,21 @@ pub(crate) fn kill_process_tree_grace(pid: u32, grace: std::time::Duration) {
             libc::kill(pg, libc::SIGKILL);
         }
     }
+}
+
+#[cfg(unix)]
+fn process_group_exists(pid: u32) -> bool {
+    let Ok(pgid) = i32::try_from(pid) else {
+        return false;
+    };
+    let rc = unsafe { libc::kill(-pgid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EPERM)
+    )
 }
 
 pub(crate) fn resolve_ffmpeg(
@@ -244,22 +345,21 @@ async fn check_ffmpeg(state: tauri::State<'_, AppState>) -> Result<ToolStatus, S
 
 #[tauri::command]
 async fn check_js_runtime() -> ToolStatus {
-    let path_only = locate::ToolLookup {
-        allow_path: true,
-        ..Default::default()
-    };
-    if let Ok((p, src)) = locate::locate_tool("deno", None, &path_only) {
-        return probe(&p, &["--version"], src).await;
-    }
-    if let Ok((p, src)) = locate::locate_tool("node", None, &path_only) {
-        return probe(&p, &["--version"], src).await;
-    }
-    ToolStatus {
-        available: false,
-        path: None,
-        version: None,
-        error: Some("未找到 JS 运行时（deno/node）：YouTube 播放列表/频道页解析需要".into()),
-        source: None,
+    match resolve_supported_js_runtime() {
+        Ok(r) => ToolStatus {
+            available: true,
+            path: Some(r.path.to_string_lossy().into_owned()),
+            version: Some(r.version),
+            error: None,
+            source: Some(r.source),
+        },
+        Err(e) => ToolStatus {
+            available: false,
+            path: None,
+            version: None,
+            error: Some(e),
+            source: None,
+        },
     }
 }
 
@@ -322,6 +422,12 @@ pub(crate) fn resolve_update_target(
     resource_dir: Option<&PathBuf>,
     managed_dir: Option<&PathBuf>,
 ) -> Result<(PathBuf, locate::ToolSource), String> {
+    if src == locate::ToolSource::Override {
+        return Err(
+            "ENGINE_UPDATE_EXTERNAL_OVERRIDE:当前使用自定义 yt-dlp 路径，请由外部工具管理更新"
+                .into(),
+        );
+    }
     if src == locate::ToolSource::Managed {
         if is_under(&src_path, resource_dir) {
             return Err("拒绝修改安装包内的 bundled 引擎".into());
@@ -488,6 +594,62 @@ mod tests {
     }
 
     #[test]
+    fn parses_supported_js_runtime_versions() {
+        assert_eq!(parse_numeric_version("deno 2.3.0\nv8 13"), Some((2, 3, 0)));
+        assert_eq!(parse_numeric_version("v22.11.0"), Some((22, 11, 0)));
+        assert_eq!(parse_numeric_version("  v22.0.0\nextra"), Some((22, 0, 0)));
+        assert_eq!(parse_numeric_version("node 24"), Some((24, 0, 0)));
+        assert_eq!(parse_numeric_version("unknown"), None);
+        assert!(parse_numeric_version("v22.0.0").unwrap() >= NODE_MIN_VERSION);
+        assert!(parse_numeric_version("deno 2.2.9").unwrap() < DENO_MIN_VERSION);
+
+        let candidates = [("deno", "deno 2.2.9"), ("node", "v22.0.0")];
+        let selected = candidates
+            .into_iter()
+            .find(|(name, version)| validate_runtime_version(name, version).is_ok())
+            .map(|(name, _)| name);
+        assert_eq!(selected, Some("node"));
+        assert!(validate_runtime_version("node", "v20.19.0").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grace_period_tracks_the_whole_unix_process_group() {
+        use std::os::unix::process::CommandExt;
+
+        let dir = std::env::temp_dir().join(format!("ytdlp-process-group-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("child-survived");
+        let child_pid_file = dir.join("child-pid");
+        let mut command = std::process::Command::new("/bin/sh");
+        command.process_group(0);
+        let mut parent = command
+            .env("SURVIVED_MARKER", &marker)
+            .env("CHILD_PID_FILE", &child_pid_file)
+            .args([
+                "-c",
+                "trap 'exit 0' TERM; (trap '' TERM; sleep 0.4; echo survived >\"$SURVIVED_MARKER\"; while :; do sleep 1; done) & echo $! >\"$CHILD_PID_FILE\"; wait",
+            ])
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !child_pid_file.is_file() {
+            assert!(std::time::Instant::now() < deadline, "child did not start");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        kill_process_tree_grace(parent.id(), std::time::Duration::from_millis(120));
+        let _ = parent.wait();
+        std::thread::sleep(std::time::Duration::from_millis(450));
+        assert!(
+            !marker.exists(),
+            "descendant survived the grace-period kill"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn refuses_update_under_resource_dir() {
         let tmp = std::env::temp_dir().join(format!(
             "ytdlp-res-{}",
@@ -540,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn path_and_override_update_copy_to_managed_leave_source() {
+    fn path_update_copies_to_managed_and_leaves_source() {
         let tmp = std::env::temp_dir().join(format!(
             "ytdlp-pathu-{}",
             std::time::SystemTime::now()
@@ -564,6 +726,32 @@ mod tests {
         assert_eq!(std::fs::read(&src).unwrap(), b"path-bytes");
         assert_eq!(std::fs::read(&dest).unwrap(), b"path-bytes");
         assert_ne!(dest, src);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn override_update_is_rejected_without_copying() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ytdlp-override-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let managed = tmp.join("engines");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let src = tmp.join(locate::bin_name("custom-ytdlp"));
+        std::fs::write(&src, b"override-bytes").unwrap();
+        let err = resolve_update_target(
+            src.clone(),
+            locate::ToolSource::Override,
+            Some(&tmp.join("res")),
+            Some(&managed),
+        )
+        .unwrap_err();
+        assert!(err.contains("ENGINE_UPDATE_EXTERNAL_OVERRIDE"), "{err}");
+        assert_eq!(std::fs::read(&src).unwrap(), b"override-bytes");
+        assert!(!managed.exists());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
