@@ -39,10 +39,14 @@ def sha256(path: pathlib.Path) -> str:
 
 
 def copy_unique(source: pathlib.Path, out: pathlib.Path, names: set[str]) -> pathlib.Path:
-    if source.name in names:
-        sys.exit(f"duplicate release asset basename: {source.name}")
-    names.add(source.name)
-    destination = out / source.name
+    # GitHub normalizes spaces in uploaded release asset names to dots. Do the
+    # same before checksums are generated so SHA256SUMS references the names
+    # users actually download.
+    release_name = source.name.replace(" ", ".")
+    if release_name in names:
+        sys.exit(f"duplicate release asset basename: {release_name}")
+    names.add(release_name)
+    destination = out / release_name
     shutil.copy2(source, destination)
     return destination
 

@@ -72,6 +72,9 @@ jobs:
               sys.exit(f"mismatch {pkg} {cargo} {tauri}")
           PY
 
+      - name: Release script tests
+        run: python3 -m unittest scripts/test_prepare_release_assets.py
+
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
 
