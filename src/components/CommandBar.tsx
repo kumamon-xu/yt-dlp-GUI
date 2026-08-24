@@ -16,7 +16,7 @@ export default function CommandBar() {
   return (
     <div className="mt-2 flex items-center gap-2 rounded-md border border-slate-800 bg-slate-950/60 px-2 py-1.5">
       <Terminal size={12} className="shrink-0 text-slate-500" />
-      <code className="min-w-0 flex-1 truncate font-mono text-[11px] text-slate-400" title={cmd}>
+      <code className="min-w-0 flex-1 truncate font-mono text-[11px] text-slate-400" title={`${cmd}\n${t("cmd.disclaimer")}`}>
         {cmd || t("cmd.title")}
       </code>
       <button

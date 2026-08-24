@@ -1,10 +1,14 @@
 //! 任务管理：并发队列、generation 所有权、杀进程树、进度事件
 
-use crate::command::{build_args, NewTask, TaskKind};
+use crate::command::{
+    apply_kind_constraints, apply_settings, build_args, needs_ffmpeg, NewTask, TaskKind,
+};
 use crate::parser::{classify_error, parse_progress, FILE_PREFIX};
-use crate::{find_engine, find_ffmpeg, js_runtime_arg, kill_process_tree, no_window_cmd, AppState};
+use crate::{
+    find_engine, js_runtime_arg, kill_process_tree_grace, no_window_cmd, resolve_ffmpeg, AppState,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -39,7 +43,6 @@ impl TaskStatus {
     pub fn is_running_download(self) -> bool {
         matches!(self, TaskStatus::Downloading | TaskStatus::Postprocess)
     }
-    #[allow(dead_code)]
     pub fn can_enter(self, next: TaskStatus) -> bool {
         use TaskStatus::*;
         match (self, next) {
@@ -49,8 +52,20 @@ impl TaskStatus {
             (Downloading, Postprocess | Paused | Canceled | Failed | Done) => true,
             (Postprocess, Done | Failed | Paused | Canceled) => true,
             (Paused, Queued | Canceled) => true,
+            (Failed | Canceled | Done, Canceled) => true,
             _ => false,
         }
+    }
+}
+
+fn transition(p: &mut TaskPayload, next: TaskStatus) {
+    if p.status.can_enter(next) {
+        p.status = next;
+        return;
+    }
+    debug_assert!(false, "illegal status {:?} -> {:?}", p.status, next);
+    if next == TaskStatus::Canceled {
+        p.status = next;
     }
 }
 
@@ -83,7 +98,7 @@ struct TaskSnapshot {
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct QueueFile {
+pub(crate) struct QueueFile {
     schema_version: u32,
     tasks: Vec<TaskSnapshot>,
 }
@@ -103,6 +118,7 @@ pub struct TaskInner {
 pub struct TaskManager {
     pub tasks: Mutex<HashMap<String, Arc<TaskInner>>>,
     pub order: Mutex<Vec<String>>,
+    pub tombstones: Mutex<HashSet<String>>,
 }
 
 impl Default for TaskManager {
@@ -110,6 +126,7 @@ impl Default for TaskManager {
         Self {
             tasks: Mutex::new(HashMap::new()),
             order: Mutex::new(Vec::new()),
+            tombstones: Mutex::new(HashSet::new()),
         }
     }
 }
@@ -145,15 +162,100 @@ pub fn claim_next(mgr: &TaskManager, cap: u32) -> Option<Arc<TaskInner>> {
     if live_count(&map) >= cap {
         return None;
     }
-    let id = oldest_queued(&order, |id| {
-        map.get(id)
-            .map(|t| t.payload.lock().unwrap().status == TaskStatus::Queued)
-            .unwrap_or(false)
-    })?
-    .to_string();
+    let id = {
+        let stones = mgr.tombstones.lock().unwrap();
+        oldest_queued(&order, |id| {
+            if stones.contains(id) {
+                return false;
+            }
+            map.get(id)
+                .map(|t| {
+                    !t.canceled.load(Ordering::SeqCst)
+                        && t.payload.lock().unwrap().status == TaskStatus::Queued
+                })
+                .unwrap_or(false)
+        })?
+        .to_string()
+    };
     let inner = map.get(&id).cloned()?;
-    inner.payload.lock().unwrap().status = TaskStatus::Starting;
+    {
+        let mut p = inner.payload.lock().unwrap();
+        transition(&mut p, TaskStatus::Starting);
+    }
     Some(inner)
+}
+
+pub fn should_emit(mgr: &TaskManager, id: &str) -> bool {
+    if !mgr.tasks.lock().unwrap().contains_key(id) {
+        return false;
+    }
+    !mgr.tombstones.lock().unwrap().contains(id)
+}
+
+#[allow(dead_code)]
+pub fn live_task_ids(mgr: &TaskManager) -> Vec<String> {
+    let (map, order) = lock_maps(mgr);
+    order
+        .iter()
+        .filter(|id| map.contains_key(*id))
+        .cloned()
+        .collect()
+}
+
+pub fn retire_inner(inner: &TaskInner) {
+    {
+        let _run = inner.run_mu.lock().unwrap();
+        inner.run_generation.fetch_add(1, Ordering::SeqCst);
+        inner.canceled.store(true, Ordering::SeqCst);
+    }
+    kill_inner_grace(inner, std::time::Duration::from_millis(400));
+}
+
+pub fn remove_id(mgr: &TaskManager, id: &str) -> Option<Arc<TaskInner>> {
+    let inner = {
+        let (mut map, mut order) = lock_maps(mgr);
+        mgr.tombstones.lock().unwrap().insert(id.to_string());
+        order.retain(|x| x != id);
+        map.remove(id)
+    };
+    if let Some(ref inner) = inner {
+        retire_inner(inner);
+    }
+    inner
+}
+
+fn strip_task_secrets(mut p: TaskPayload) -> TaskPayload {
+    if let Some(ref proxy) = p.request.proxy {
+        p.request.proxy = Some(crate::redact::strip_userinfo(proxy));
+    }
+    p
+}
+
+pub fn queue_snapshot(mgr: &TaskManager) -> QueueFile {
+    let mut snaps = Vec::new();
+    let (map, order) = lock_maps(mgr);
+    let stones = mgr.tombstones.lock().unwrap();
+    for id in order.iter() {
+        if stones.contains(id) {
+            continue;
+        }
+        if let Some(t) = map.get(id) {
+            snaps.push(TaskSnapshot {
+                payload: strip_task_secrets(t.payload.lock().unwrap().clone()),
+            });
+        }
+    }
+    QueueFile {
+        schema_version: 1,
+        tasks: snaps,
+    }
+}
+
+pub fn persist_queue_to(path: &std::path::Path, mgr: &TaskManager) -> Result<(), String> {
+    crate::fsutil::commit_with(path, || {
+        let file = queue_snapshot(mgr);
+        serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())
+    })
 }
 
 /// Old run must not mutate a newer generation.
@@ -198,24 +300,16 @@ pub fn apply_child_exit(inner: &TaskInner, gen: u64, success: bool) -> bool {
     true
 }
 
-fn persist(app: &AppHandle) {
+fn persist(app: &AppHandle) -> Result<(), String> {
     let mgr = app.state::<TaskManager>();
-    let mut snaps = Vec::new();
-    let (map, order) = lock_maps(mgr.inner());
-    for id in order.iter() {
-        if let Some(t) = map.get(id) {
-            snaps.push(TaskSnapshot {
-                payload: t.payload.lock().unwrap().clone(),
-            });
-        }
+    let path = crate::config::queue_path(app)?;
+    persist_queue_to(&path, mgr.inner())
+}
+
+fn persist_ok(app: &AppHandle) {
+    if let Err(e) = persist(app) {
+        let _ = app.emit("persist_error", e);
     }
-    drop(map);
-    let path = crate::config::queue_path(app);
-    let file = QueueFile {
-        schema_version: 1,
-        tasks: snaps,
-    };
-    let _ = crate::fsutil::atomic_write_json(&path, &file);
 }
 
 fn parse_queue_text(text: &str) -> Vec<TaskSnapshot> {
@@ -226,7 +320,9 @@ fn parse_queue_text(text: &str) -> Vec<TaskSnapshot> {
 }
 
 pub fn restore_queue(app: &AppHandle) {
-    let path = crate::config::queue_path(app);
+    let Ok(path) = crate::config::queue_path(app) else {
+        return;
+    };
     let Ok(text) = std::fs::read_to_string(&path) else {
         return;
     };
@@ -363,59 +459,6 @@ fn settings_snapshot(app: &AppHandle) -> crate::GlobalSettings {
         .unwrap_or_default()
 }
 
-fn apply_settings(task: &mut NewTask, s: &crate::GlobalSettings) {
-    if task.out_dir.as_ref().map(|x| x.is_empty()).unwrap_or(true) && !s.out_dir.is_empty() {
-        task.out_dir = Some(s.out_dir.clone());
-    }
-    if task
-        .out_template
-        .as_ref()
-        .map(|x| x.is_empty())
-        .unwrap_or(true)
-        && !s.out_template.is_empty()
-    {
-        task.out_template = Some(s.out_template.clone());
-    }
-    if task.concurrent_fragments.is_none() {
-        task.concurrent_fragments = Some(s.concurrent_fragments);
-    }
-    if task
-        .limit_rate
-        .as_ref()
-        .map(|x| x.is_empty())
-        .unwrap_or(true)
-    {
-        task.limit_rate = s.limit_rate.clone();
-    }
-    if task
-        .cookies_file
-        .as_ref()
-        .map(|x| x.is_empty())
-        .unwrap_or(true)
-    {
-        task.cookies_file = s.cookies_file.clone();
-    }
-    if task
-        .cookies_browser
-        .as_ref()
-        .map(|x| x.is_empty())
-        .unwrap_or(true)
-    {
-        task.cookies_browser = s.cookies_browser.clone();
-    }
-    if task.proxy.as_ref().map(|x| x.is_empty()).unwrap_or(true) {
-        task.proxy = s.proxy.clone();
-    }
-    if task
-        .merge_format
-        .as_ref()
-        .map(|x| x.is_empty())
-        .unwrap_or(true)
-    {
-        task.merge_format = Some(s.merge_format.clone());
-    }
-}
-
 /// Spawn a download process. Returns the generation number.
 pub fn spawn_download_with(
     inner: Arc<TaskInner>,
@@ -448,21 +491,26 @@ pub fn spawn_download_with(
 
     let request = inner.payload.lock().unwrap().request.clone();
     let mut cfg = request.to_config();
+    if let Some(k) = request.kind {
+        apply_kind_constraints(&mut cfg, k);
+    }
     cfg.ffmpeg_location = ffmpeg.map(|p| p.to_string_lossy().into());
     cfg.js_runtime = js_runtime_arg();
     if inner.payload.lock().unwrap().status == TaskStatus::Paused || request.resume.unwrap_or(false)
     {
         cfg.resume = true;
     }
+    let download_dir = app.as_ref().and_then(|a| {
+        a.path()
+            .download_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    });
+    cfg.out_dir = crate::command::resolve_out_dir(&cfg, download_dir);
     let args = build_args(&cfg);
     *inner.args.lock().unwrap() = args.clone();
 
-    let dir = if cfg.out_dir.is_empty() {
-        crate::command::default_out_dir()
-    } else {
-        cfg.out_dir.clone()
-    };
-    let _ = std::fs::create_dir_all(&dir);
+    crate::fsutil::ensure_writable_dir(Path::new(&cfg.out_dir))?;
 
     {
         let p = inner.payload.lock().unwrap();
@@ -509,7 +557,7 @@ pub fn spawn_download_with(
             } else {
                 inner.pid.store(pid, Ordering::SeqCst);
                 *inner.child.lock().unwrap() = Some(child);
-                p.status = TaskStatus::Downloading;
+                transition(&mut p, TaskStatus::Downloading);
                 p.error = None;
                 p.error_code = None;
                 p.request.resume = Some(cfg.resume);
@@ -520,7 +568,7 @@ pub fn spawn_download_with(
     if let Some(mut child) = abort_child {
         let _ = child.start_kill();
         if pid != 0 {
-            kill_process_tree(pid);
+            kill_process_tree_grace(pid, std::time::Duration::ZERO);
         }
         return Err("任务已取消或暂停".into());
     }
@@ -537,35 +585,33 @@ pub fn spawn_download_with(
     tokio::spawn(async move { read_stdout(stdout, app1, i1, gen).await });
     tokio::spawn(async move { read_stderr(stderr, app2, i2, gen).await });
     tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let mut child = loop {
             if i3.run_generation.load(Ordering::SeqCst) != gen {
-                break;
+                return;
             }
-            let (superseded, status) = {
+            {
                 let mut g = i3.child.lock().unwrap();
                 if i3.run_generation.load(Ordering::SeqCst) != gen {
-                    (true, None)
-                } else {
-                    match g.as_mut() {
-                        Some(c) => (false, c.try_wait().ok().flatten()),
-                        None => (true, None),
-                    }
+                    return;
                 }
-            };
-            if superseded {
-                break;
+                if let Some(c) = g.take() {
+                    break c;
+                }
             }
-            if let Some(st) = status {
-                let owned = apply_child_exit(&i3, gen, st.success());
-                if owned {
-                    if let Some(app) = &app3 {
-                        emit_payload(app, &i3);
-                        persist(app);
-                        pump_queue(app.clone());
-                    }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        let st = child.wait().await;
+        let success = st.as_ref().map(|s| s.success()).unwrap_or(false);
+        let owned = apply_child_exit(&i3, gen, success);
+        if owned {
+            if let Some(app) = &app3 {
+                let id = i3.payload.lock().unwrap().id.clone();
+                let mgr = app.state::<TaskManager>();
+                if should_emit(mgr.inner(), &id) {
+                    emit_payload(app, &i3);
+                    persist_ok(app);
+                    pump_queue(app.clone());
                 }
-                break;
             }
         }
     });
@@ -577,8 +623,15 @@ fn spawn_download(app: AppHandle, inner: Arc<TaskInner>) -> Result<u64, String> 
     let mut request = inner.payload.lock().unwrap().request.clone();
     apply_settings(&mut request, &settings);
     inner.payload.lock().unwrap().request = request.clone();
+    let cfg_preview = {
+        let mut c = request.to_config();
+        if let Some(k) = request.kind {
+            apply_kind_constraints(&mut c, k);
+        }
+        c
+    };
     let engine = find_engine(settings.engine_path.as_deref())?;
-    let ffmpeg = find_ffmpeg(settings.ffmpeg_path.as_deref()).ok();
+    let ffmpeg = resolve_ffmpeg(settings.ffmpeg_path.as_deref(), needs_ffmpeg(&cfg_preview))?;
     spawn_download_with(inner, &engine, ffmpeg.as_deref(), Some(app))
 }
 
@@ -609,16 +662,19 @@ fn pump_queue(app: AppHandle) {
                 }
             }
             emit_payload(&app, &inner);
-            persist(&app);
+            persist_ok(&app);
         }
     }
 }
 
+#[cfg(test)]
 fn kill_inner(inner: &TaskInner) {
+    kill_inner_grace(inner, std::time::Duration::ZERO);
+}
+
+fn kill_inner_grace(inner: &TaskInner, grace: std::time::Duration) {
     let pid = inner.pid.load(Ordering::SeqCst);
-    if pid != 0 {
-        kill_process_tree(pid);
-    }
+    kill_process_tree_grace(pid, grace);
     if let Some(c) = inner.child.lock().unwrap().as_mut() {
         let _ = c.start_kill();
     }
@@ -688,7 +744,54 @@ pub async fn start_task(
         order.insert(0, id);
     }
     emit_payload(&app, &inner);
-    persist(&app);
+    persist(&app)?;
+    pump_queue(app);
+    Ok(())
+}
+
+#[derive(Deserialize)]
+pub struct StartItem {
+    pub id: String,
+    pub task: NewTask,
+}
+
+#[tauri::command]
+pub async fn start_tasks(
+    app: AppHandle,
+    state: State<'_, TaskManager>,
+    items: Vec<StartItem>,
+) -> Result<(), String> {
+    for it in &items {
+        crate::validate::validate_concurrent_fragments(it.task.concurrent_fragments.unwrap_or(4))?;
+        crate::validate::validate_limit_rate(it.task.limit_rate.as_deref())?;
+        crate::validate::validate_proxy(it.task.proxy.as_deref())?;
+        crate::validate::validate_playlist_items(it.task.playlist_items.as_deref())?;
+    }
+    let settings = settings_snapshot(&app);
+    {
+        let (mut map, mut order) = lock_maps(state.inner());
+        for it in items {
+            if map.contains_key(&it.id) {
+                continue;
+            }
+            let mut task = it.task;
+            apply_settings(&mut task, &settings);
+            let inner = Arc::new(TaskInner {
+                payload: Mutex::new(empty_payload(it.id.clone(), task)),
+                child: Mutex::new(None),
+                pid: AtomicU32::new(0),
+                run_generation: AtomicU64::new(0),
+                run_mu: Mutex::new(()),
+                stderr_tail: Mutex::new(VecDeque::new()),
+                canceled: AtomicBool::new(false),
+                args: Mutex::new(Vec::new()),
+            });
+            map.insert(it.id.clone(), Arc::clone(&inner));
+            order.insert(0, it.id);
+            emit_payload(&app, &inner);
+        }
+    }
+    persist(&app)?;
     pump_queue(app);
     Ok(())
 }
@@ -709,12 +812,12 @@ pub async fn cancel_task(
     inner.canceled.store(true, Ordering::SeqCst);
     {
         let mut p = inner.payload.lock().unwrap();
-        p.status = TaskStatus::Canceled;
+        transition(&mut p, TaskStatus::Canceled);
         p.speed = 0.0;
     }
     emit_payload(&app, &inner);
-    kill_inner(&inner);
-    persist(&app);
+    kill_inner_grace(&inner, std::time::Duration::from_millis(400));
+    persist_ok(&app);
     pump_queue(app);
     Ok(())
 }
@@ -735,16 +838,16 @@ pub async fn pause_task(
     {
         let mut p = inner.payload.lock().unwrap();
         if p.status == TaskStatus::Queued || p.status == TaskStatus::Starting {
-            p.status = TaskStatus::Paused;
+            transition(&mut p, TaskStatus::Paused);
         } else if p.status.is_running_download() {
-            p.status = TaskStatus::Paused;
+            transition(&mut p, TaskStatus::Paused);
             p.speed = 0.0;
             p.request.resume = Some(true);
         }
     }
     emit_payload(&app, &inner);
-    kill_inner(&inner);
-    persist(&app);
+    kill_inner_grace(&inner, std::time::Duration::from_millis(1500));
+    persist_ok(&app);
     pump_queue(app);
     Ok(())
 }
@@ -768,13 +871,13 @@ pub async fn resume_task(
             return Err("只能恢复已暂停的任务".into());
         }
         p.request.resume = Some(true);
-        p.status = TaskStatus::Queued;
+        transition(&mut p, TaskStatus::Queued);
         p.error = None;
         p.error_code = None;
     }
     inner.canceled.store(false, Ordering::SeqCst);
     emit_payload(&app, &inner);
-    persist(&app);
+    persist_ok(&app);
     pump_queue(app);
     Ok(())
 }
@@ -785,20 +888,8 @@ pub async fn remove_task(
     state: State<'_, TaskManager>,
     id: String,
 ) -> Result<(), String> {
-    let inner = state.tasks.lock().unwrap().get(&id).cloned();
-    if let Some(inner) = inner {
-        let st = inner.payload.lock().unwrap().status;
-        if st.is_live() || st == TaskStatus::Queued {
-            inner.canceled.store(true, Ordering::SeqCst);
-            kill_inner(&inner);
-        }
-    }
-    {
-        let (mut map, mut order) = lock_maps(state.inner());
-        map.remove(&id);
-        order.retain(|x| x != &id);
-    }
-    persist(&app);
+    remove_id(state.inner(), &id);
+    persist_ok(&app);
     pump_queue(app);
     Ok(())
 }
@@ -1363,5 +1454,198 @@ fn main() {{
         let st = inner.payload.lock().unwrap().status;
         assert_ne!(st, TaskStatus::Failed);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pause_remove_old_exit_does_not_resurface() {
+        let dir = std::env::temp_dir().join(format!(
+            "fake-rm-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = compile_fake(&dir, "rm", 800);
+        let mgr = TaskManager::default();
+        let inner = make_inner("t", "https://example.com");
+        enqueue(&mgr, Arc::clone(&inner));
+        let claimed = claim_next(&mgr, 2).expect("queued task");
+        assert_eq!(claimed.payload.lock().unwrap().id, "t");
+        spawn_download_with(Arc::clone(&inner), &engine, None, None).unwrap();
+        let start = std::time::Instant::now();
+        while inner.pid.load(Ordering::SeqCst) == 0 {
+            if start.elapsed() > std::time::Duration::from_secs(2) {
+                panic!("child never started");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        {
+            let mut p = inner.payload.lock().unwrap();
+            transition(&mut p, TaskStatus::Paused);
+        }
+        let old_gen = inner.run_generation.load(Ordering::SeqCst);
+        remove_id(&mgr, "t");
+        assert!(!should_emit(&mgr, "t"));
+        assert!(live_task_ids(&mgr).is_empty());
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(
+            !apply_child_exit(&inner, old_gen, false),
+            "waiter generation must be invalidated by remove"
+        );
+        assert!(!should_emit(&mgr, "t"));
+        let st = inner.payload.lock().unwrap().status;
+        assert_ne!(st, TaskStatus::Done, "stale waiter must not mark done");
+        assert_ne!(st, TaskStatus::Failed, "stale waiter must not mark failed");
+        let q = queue_snapshot(&mgr);
+        assert!(q.tasks.is_empty(), "deleted id must not persist");
+        let path = dir.join("queue.json");
+        persist_queue_to(&path, &mgr).unwrap();
+        let disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(disk["tasks"].as_array().unwrap().len(), 0);
+        assert!(live_task_ids(&mgr).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn queued_remove_is_not_claimed() {
+        let mgr = TaskManager::default();
+        enqueue(&mgr, make_inner("q1", "https://example.com"));
+        remove_id(&mgr, "q1");
+        assert!(claim_next(&mgr, 2).is_none());
+        assert!(!should_emit(&mgr, "q1"));
+        assert!(queue_snapshot(&mgr).tasks.is_empty());
+    }
+
+    #[test]
+    fn queue_snapshot_strips_proxy_password() {
+        let mgr = TaskManager::default();
+        let inner = make_inner("s", "https://example.com");
+        inner.payload.lock().unwrap().request.proxy =
+            Some("http://alice:secret@127.0.0.1:7890".into());
+        enqueue(&mgr, inner);
+        let snap = queue_snapshot(&mgr);
+        let proxy = snap.tasks[0].payload.request.proxy.clone().unwrap();
+        assert!(!proxy.contains("secret"), "{proxy}");
+        assert_eq!(proxy, "http://127.0.0.1:7890");
+    }
+
+    #[tokio::test]
+    async fn spawn_empty_out_dir_puts_known_folder_in_argv() {
+        let dir = std::env::temp_dir().join(format!(
+            "fake-paths-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = compile_fake(&dir, "paths", 50);
+        let inner = make_inner("t", "https://example.com");
+        inner.payload.lock().unwrap().request.out_dir = Some(String::new());
+        inner.payload.lock().unwrap().status = TaskStatus::Starting;
+        spawn_download_with(Arc::clone(&inner), &engine, None, None).unwrap();
+        let args = inner.args.lock().unwrap().clone();
+        let i = args.iter().position(|x| x == "--paths").expect("--paths");
+        assert_eq!(args[i + 1], crate::command::default_out_dir());
+        assert_ne!(args[i + 1], ".");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delayed_pre_remove_snapshot_cannot_restore_id() {
+        for round in 0..16 {
+            let dir = std::env::temp_dir().join(format!(
+                "ytdlp-stale-q-{}-{round}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("queue.json");
+            let mgr = Arc::new(TaskManager::default());
+            enqueue(&mgr, make_inner("gone", "https://example.com"));
+            persist_queue_to(&path, &mgr).unwrap();
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let mgr_t = Arc::clone(&mgr);
+            let path_t = path.clone();
+            let start_t = Arc::clone(&start);
+            let h = std::thread::spawn(move || {
+                start_t.wait();
+                persist_queue_to(&path_t, &mgr_t).unwrap();
+            });
+            start.wait();
+            remove_id(&mgr, "gone");
+            persist_queue_to(&path, &mgr).unwrap();
+            h.join().unwrap();
+            let disk: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(
+                disk["tasks"].as_array().unwrap().len(),
+                0,
+                "round {round}: persist_queue_to must re-snapshot; deleted id must not return"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pump_remove_starting_does_not_respawn() {
+        let dir = std::env::temp_dir().join(format!(
+            "fake-pump-rm-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = compile_fake(&dir, "pumprm", 350);
+        let mgr = TaskManager::default();
+        for i in 0..4 {
+            enqueue(&mgr, make_inner(&format!("p{i}"), "https://example.com"));
+        }
+        let a = claim_next(&mgr, 2).expect("a");
+        let b = claim_next(&mgr, 2).expect("b");
+        spawn_download_with(Arc::clone(&a), &engine, None, None).unwrap();
+        spawn_download_with(Arc::clone(&b), &engine, None, None).unwrap();
+        let gone = a.payload.lock().unwrap().id.clone();
+        remove_id(&mgr, &gone);
+        while let Some(inner) = claim_next(&mgr, 2) {
+            assert_ne!(inner.payload.lock().unwrap().id, gone);
+            spawn_download_with(Arc::clone(&inner), &engine, None, None).unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!should_emit(&mgr, &gone));
+        assert!(!live_task_ids(&mgr).iter().any(|id| id == &gone));
+        let snap = queue_snapshot(&mgr);
+        assert!(
+            !snap.tasks.iter().any(|t| t.payload.id == gone),
+            "removed starting task must not persist"
+        );
+        let live = mgr
+            .tasks
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|t| t.payload.lock().unwrap().status.is_live())
+            .count();
+        assert!(
+            live <= 2,
+            "never more than cap live after remove, got {live}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tombstoned_queued_is_not_claimed() {
+        let mgr = TaskManager::default();
+        enqueue(&mgr, make_inner("dead", "https://example.com"));
+        mgr.tombstones.lock().unwrap().insert("dead".into());
+        assert!(
+            claim_next(&mgr, 2).is_none(),
+            "tombstone must block claim even if the row is still queued"
+        );
     }
 }

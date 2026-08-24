@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Download, Film, ListVideo, Loader2, RefreshCw } from "lucide-react";
 import { useAppStore, useT } from "../store";
 import { customFormatFromSelection, fmtDuration, formatOptions } from "../lib/format";
+import { compressPlaylistItems } from "../lib/ytdlp";
 import type { VideoInfo } from "../lib/ytdlp";
 
 function Thumb({ url, className }: { url: string | null; className: string }) {
@@ -100,12 +101,10 @@ function PlaylistCard({ info }: { info: VideoInfo }) {
   const preview = useAppStore((s) => s.preview);
   const t = useT();
   const all = info.playlist ?? [];
-  const allIds = all.map((i) => i.id);
-  const allSelected = allIds.length > 0 && selected.length === allIds.length;
-  const playlistItems = all
-    .map((it, i) => (selected.includes(it.id) ? String(i + 1) : null))
-    .filter(Boolean)
-    .join(",");
+  const allIdx = all.map((_, i) => i + 1);
+  const selectedSet = new Set(selected);
+  const allSelected = allIdx.length > 0 && selected.length === allIdx.length;
+  const playlistItems = selected.length === all.length ? undefined : compressPlaylistItems(selected);
 
   return (
     <div className="flex flex-col gap-4">
@@ -118,14 +117,14 @@ function PlaylistCard({ info }: { info: VideoInfo }) {
           </p>
         </div>
         <label className="flex cursor-pointer items-center gap-2 text-xs text-slate-300">
-          <input type="checkbox" checked={allSelected} onChange={(e) => setAllItems(allIds, e.target.checked)} className="accent-sky-500" />
+          <input type="checkbox" checked={allSelected} onChange={(e) => setAllItems(allIdx, e.target.checked)} className="accent-sky-500" />
           {t("preview.selectAll")}（{selected.length}/{all.length}）
         </label>
       </div>
       <div className="max-h-56 space-y-1 overflow-y-auto rounded-lg border border-slate-800 bg-slate-900/50 p-1.5">
         {items.map((it, idx) => (
-          <div key={it.id} className="flex items-center gap-3 rounded-md px-3 py-2 text-sm hover:bg-slate-800">
-            <input type="checkbox" checked={selected.includes(it.id)} onChange={() => toggleItem(it.id)} className="accent-sky-500" />
+          <div key={`${idx}:${it.id}`} className="flex items-center gap-3 rounded-md px-3 py-2 text-sm hover:bg-slate-800">
+            <input type="checkbox" checked={selectedSet.has(idx + 1)} onChange={() => toggleItem(idx + 1)} className="accent-sky-500" />
             <span className="w-8 shrink-0 text-right text-xs text-slate-600">{idx + 1}</span>
             <button
               type="button"

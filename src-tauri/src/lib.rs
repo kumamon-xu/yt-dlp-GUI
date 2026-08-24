@@ -6,6 +6,7 @@ mod fsutil;
 mod info;
 mod locate;
 mod parser;
+mod redact;
 mod tasks;
 mod validate;
 
@@ -90,23 +91,56 @@ pub(crate) fn js_runtime_arg() -> Option<String> {
 }
 
 pub(crate) fn kill_process_tree(pid: u32) {
+    kill_process_tree_grace(pid, std::time::Duration::ZERO);
+}
+
+pub(crate) fn kill_process_tree_grace(pid: u32, grace: std::time::Duration) {
     if pid == 0 {
         return;
     }
     #[cfg(windows)]
     {
+        let _ = grace;
         let mut cmd = std::process::Command::new("taskkill");
         no_window_std(&mut cmd);
         let _ = cmd.args(["/F", "/T", "/PID", &pid.to_string()]).status();
     }
     #[cfg(unix)]
     {
-        // process_group(0) makes pid == pgid; negative kill targets the group (yt-dlp + ffmpeg).
         let pg = -(pid as i32);
         unsafe {
             libc::kill(pg, libc::SIGTERM);
+        }
+        if !grace.is_zero() {
+            let deadline = std::time::Instant::now() + grace;
+            while std::time::Instant::now() < deadline {
+                let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+                if !alive {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            }
+        }
+        unsafe {
             libc::kill(pg, libc::SIGKILL);
         }
+    }
+}
+
+pub(crate) fn resolve_ffmpeg(
+    override_path: Option<&str>,
+    required: bool,
+) -> Result<Option<PathBuf>, String> {
+    let explicit = override_path.map(str::trim).filter(|s| !s.is_empty());
+    if explicit.is_some() {
+        return locate::locate_tool("ffmpeg", explicit, &current_lookup())
+            .map(|(p, _)| Some(p))
+            .map_err(|e| format!("FFMPEG_INVALID_OVERRIDE:{e}"));
+    }
+    match find_ffmpeg(None) {
+        Ok(p) => Ok(Some(p)),
+        Err(e) if required => Err(format!("FFMPEG_MISSING:{e}")),
+        Err(_) => Ok(None),
     }
 }
 
@@ -248,13 +282,21 @@ fn build_command(
 ) -> Result<String, String> {
     let (eng, ff) = overrides(&state);
     let engine = find_engine(eng.as_deref())?;
-    let mut cfg = task.to_config();
-    cfg.ffmpeg_location = find_ffmpeg(ff.as_deref())
+    let settings = state
+        .settings
+        .lock()
         .ok()
-        .map(|p| p.to_string_lossy().into());
+        .map(|s| s.clone())
+        .unwrap_or_default();
+    let mut cfg = command::resolve_effective_config(task, &settings);
+    let ff = resolve_ffmpeg(ff.as_deref(), command::needs_ffmpeg(&cfg))?;
+    cfg.ffmpeg_location = ff.map(|p| p.to_string_lossy().into());
     cfg.js_runtime = js_runtime_arg();
     let args = command::build_args(&cfg);
-    Ok(command::format_command(&engine.to_string_lossy(), &args))
+    Ok(crate::redact::format_command_preview(
+        &engine.to_string_lossy(),
+        &args,
+    ))
 }
 
 fn is_under(path: &Path, root: Option<&PathBuf>) -> bool {
@@ -276,33 +318,39 @@ pub(crate) fn resolve_update_target(
     resource_dir: Option<&PathBuf>,
     managed_dir: Option<&PathBuf>,
 ) -> Result<(PathBuf, locate::ToolSource), String> {
-    let target = if src == locate::ToolSource::Bundled {
-        let dir = managed_dir.ok_or_else(|| "未配置用户引擎目录".to_string())?;
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        let dest = dir.join(locate::bin_name("yt-dlp"));
-        std::fs::copy(&src_path, &dest).map_err(|e| format!("无法复制到用户目录：{e}"))?;
-        dest
-    } else {
-        src_path
-    };
-    if is_under(&target, resource_dir) {
+    if src == locate::ToolSource::Managed {
+        if is_under(&src_path, resource_dir) {
+            return Err("拒绝修改安装包内的 bundled 引擎".into());
+        }
+        return Ok((src_path, locate::ToolSource::Managed));
+    }
+    let dir = managed_dir.ok_or_else(|| "未配置用户引擎目录".to_string())?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let dest = dir.join(locate::bin_name("yt-dlp"));
+    std::fs::copy(&src_path, &dest).map_err(|e| format!("无法复制到用户目录：{e}"))?;
+    if is_under(&dest, resource_dir) {
         return Err("拒绝修改安装包内的 bundled 引擎".into());
     }
-    let new_src = if src == locate::ToolSource::Bundled {
-        locate::ToolSource::Managed
-    } else {
-        src
-    };
-    Ok((target, new_src))
+    Ok((dest, locate::ToolSource::Managed))
+}
+
+fn engine_update_lock() -> &'static tokio::sync::Mutex<()> {
+    static L: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 #[tauri::command]
 async fn update_engine(state: tauri::State<'_, AppState>) -> Result<EngineUpdateResult, String> {
+    let _upd = engine_update_lock().lock().await;
     let (eng, _) = overrides(&state);
     let (src_path, src) = locate::locate_tool("yt-dlp", eng.as_deref(), &current_lookup())?;
     let old = probe(&src_path, &["--version"], src).await.version;
     let (target, new_src) =
-        resolve_update_target(src_path, src, RESOURCE_DIR.get(), MANAGED_DIR.get())?;
+        resolve_update_target(src_path.clone(), src, RESOURCE_DIR.get(), MANAGED_DIR.get())?;
+    let backup = target.with_extension("bak");
+    if target.exists() {
+        let _ = std::fs::copy(&target, &backup);
+    }
     let out = no_window_cmd(&target)
         .arg("-U")
         .output()
@@ -312,6 +360,9 @@ async fn update_engine(state: tauri::State<'_, AppState>) -> Result<EngineUpdate
     let stderr = String::from_utf8_lossy(&out.stderr);
     let message = format!("{stdout}{stderr}").trim().to_string();
     if !out.status.success() {
+        if backup.exists() {
+            let _ = std::fs::copy(&backup, &target);
+        }
         return Err(if message.is_empty() {
             "yt-dlp -U 失败".into()
         } else {
@@ -319,6 +370,12 @@ async fn update_engine(state: tauri::State<'_, AppState>) -> Result<EngineUpdate
         });
     }
     let new = probe(&target, &["--version"], new_src).await.version;
+    if new.is_none() {
+        if backup.exists() {
+            let _ = std::fs::copy(&backup, &target);
+        }
+        return Err("更新后 --version 失败，已回滚".into());
+    }
     Ok(EngineUpdateResult {
         updated: old != new,
         old_version: old,
@@ -382,9 +439,10 @@ pub fn run() {
             if let Ok(dir) = app.path().app_local_data_dir() {
                 set_managed_dir(dir.join("engines"));
             }
-            let s = config::load_from_disk(app.handle());
-            if let Ok(mut g) = app.state::<AppState>().settings.lock() {
-                *g = s;
+            if let Ok(s) = config::load_from_disk(app.handle()) {
+                if let Ok(mut g) = app.state::<AppState>().settings.lock() {
+                    *g = s;
+                }
             }
             tasks::restore_queue(app.handle());
             let _ = setup_tray(app);
@@ -400,6 +458,7 @@ pub fn run() {
             update_engine,
             info::get_info,
             tasks::start_task,
+            tasks::start_tasks,
             tasks::cancel_task,
             tasks::remove_task,
             tasks::pause_task,
@@ -474,5 +533,41 @@ mod tests {
         assert_eq!(std::fs::read(&src).unwrap(), b"bundled-bytes");
         assert_eq!(std::fs::read(&dest).unwrap(), b"bundled-bytes");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn path_and_override_update_copy_to_managed_leave_source() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ytdlp-pathu-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let managed = tmp.join("engines");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let src = tmp.join("on-path").join(locate::bin_name("yt-dlp"));
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(&src, b"path-bytes").unwrap();
+        let (dest, kind) = resolve_update_target(
+            src.clone(),
+            locate::ToolSource::Path,
+            Some(&tmp.join("res")),
+            Some(&managed),
+        )
+        .unwrap();
+        assert_eq!(kind, locate::ToolSource::Managed);
+        assert_eq!(std::fs::read(&src).unwrap(), b"path-bytes");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"path-bytes");
+        assert_ne!(dest, src);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn explicit_bad_ffmpeg_override_is_err() {
+        let err = resolve_ffmpeg(Some(r"Z:\definitely-missing-ffmpeg\ffmpeg.exe"), true);
+        assert!(err.is_err());
+        let msg = err.unwrap_err();
+        assert!(msg.contains("FFMPEG_INVALID_OVERRIDE"), "{msg}");
     }
 }

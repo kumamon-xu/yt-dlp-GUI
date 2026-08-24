@@ -1,10 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
+  acceptTaskUpdate,
+  canCancelStatus,
+  canRemoveStatus,
+  compressPlaylistItems,
   isCurrentToken,
+  redactUserinfo,
   resolveDownloadPreset,
   retryTaskRequest,
   settingsDraftDirty,
   splitUrls,
+  toolboxTask,
   type GlobalSettings,
   type NewTask,
 } from "./ytdlp";
@@ -75,5 +81,44 @@ describe("isCurrentToken", () => {
   it("drops stale preview results", () => {
     expect(isCurrentToken(1, 2)).toBe(false);
     expect(isCurrentToken(3, 3)).toBe(true);
+  });
+});
+
+describe("queued buttons", () => {
+  it("allows cancel and remove on queued", () => {
+    expect(canCancelStatus("queued")).toBe(true);
+    expect(canRemoveStatus("queued")).toBe(true);
+    expect(canRemoveStatus("downloading")).toBe(false);
+  });
+});
+
+describe("acceptTaskUpdate", () => {
+  it("ignores ids that were removed locally", () => {
+    const known = new Set(["a"]);
+    expect(acceptTaskUpdate(known, "a")).toBe(true);
+    expect(acceptTaskUpdate(known, "deleted")).toBe(false);
+  });
+});
+
+describe("compressPlaylistItems", () => {
+  it("compresses consecutive indices", () => {
+    expect(compressPlaylistItems([1, 2, 3, 5, 8, 9, 10])).toBe("1-3,5,8-10");
+    expect(compressPlaylistItems(Array.from({ length: 200 }, (_, i) => i + 1))).toBe("1-200");
+  });
+});
+
+describe("redactUserinfo", () => {
+  it("masks proxy password", () => {
+    expect(redactUserinfo("http://alice:secret@127.0.0.1:7890")).toBe("http://alice:***@127.0.0.1:7890");
+  });
+});
+
+describe("toolboxTask", () => {
+  it("does not inherit writeSubs for metadata", () => {
+    const t = toolboxTask("https://x", "metadata", { proxy: "http://h" });
+    expect(t.kind).toBe("metadata");
+    expect(t.writeInfoJson).toBe(true);
+    expect(t.writeSubs).toBe(false);
+    expect(t.sponsorblock).toBeUndefined();
   });
 });

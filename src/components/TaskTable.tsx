@@ -1,10 +1,10 @@
 import { Download, FolderOpen, Pause, Play, RotateCcw, Trash2, X } from "lucide-react";
-import { openFolder } from "../lib/ytdlp";
+import { canCancelStatus, canRemoveStatus, openFolder } from "../lib/ytdlp";
 import { fmtEta, fmtSize, fmtSpeed } from "../lib/format";
 import { useAppStore, useT } from "../store";
 
 function TaskRow({ id }: { id: string }) {
-  const task = useAppStore((s) => s.tasks.find((t) => t.id === id));
+  const task = useAppStore((s) => s.tasks.find((t) => t.id === id) ?? null);
   const t = useT();
   const cancel = useAppStore((s) => s.cancel);
   const pause = useAppStore((s) => s.pause);
@@ -49,14 +49,14 @@ function TaskRow({ id }: { id: string }) {
           </p>
         </div>
         {running && (
-          <>
             <button onClick={() => void pause(id)} className="rounded-md border border-zinc-700 p-1.5 text-zinc-300 hover:bg-zinc-800" title={t("action.pause")}>
               <Pause className="h-3.5 w-3.5" />
             </button>
+        )}
+        {canCancelStatus(task.status) && (
             <button onClick={() => void cancel(id)} className="rounded-md border border-zinc-700 p-1.5 text-zinc-300 hover:bg-zinc-800" title={t("action.cancel")}>
               <X className="h-3.5 w-3.5" />
             </button>
-          </>
         )}
         {task.status === "paused" && (
           <button onClick={() => void resume(id)} className="rounded-md border border-zinc-700 p-1.5 text-zinc-300 hover:bg-zinc-800" title={t("action.resume")}>
@@ -73,7 +73,7 @@ function TaskRow({ id }: { id: string }) {
             <RotateCcw className="h-3.5 w-3.5" />
           </button>
         )}
-        {task.status === "done" || task.status === "failed" || task.status === "canceled" || task.status === "paused" ? (
+        {canRemoveStatus(task.status) ? (
           <button onClick={() => void remove(id)} className="rounded-md border border-zinc-800 p-1.5 text-zinc-500 hover:bg-zinc-800" title={t("action.remove")}>
             <Trash2 className="h-3.5 w-3.5" />
           </button>

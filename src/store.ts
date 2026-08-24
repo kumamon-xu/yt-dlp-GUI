@@ -19,7 +19,10 @@ import {
   retryTaskRequest,
   splitUrls,
   startTask,
+  startTasks,
   isCurrentToken,
+  acceptTaskUpdate,
+  toolboxTask,
   toolError,
   type GlobalSettings,
   type NewTask,
@@ -77,11 +80,11 @@ interface AppState {
   previewUrl: string;
   previewInfo: VideoInfo | null;
   previewError: string | null;
-  selectedItems: string[];
+  selectedItems: number[];
   selectedFormat: string | null;
   preview: (url: string, flat?: boolean) => Promise<void>;
-  toggleItem: (id: string) => void;
-  setAllItems: (ids: string[], on: boolean) => void;
+  toggleItem: (index: number) => void;
+  setAllItems: (indices: number[], on: boolean) => void;
   selectFormat: (id: string) => void;
 
   tasks: TaskPayload[];
@@ -113,8 +116,20 @@ interface AppState {
 
 let previewToken = 0;
 let eventsBound = false;
+let unlistenTaskUpdated: (() => void) | null = null;
+let unlistenTaskLog: (() => void) | null = null;
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 let saveSeq = 0;
+let commandSeq = 0;
+let commandTimer: ReturnType<typeof setTimeout> | null = null;
+
+function clearTaskEventListeners() {
+  unlistenTaskUpdated?.();
+  unlistenTaskLog?.();
+  unlistenTaskUpdated = null;
+  unlistenTaskLog = null;
+  eventsBound = false;
+}
 
 function readSavedLang(): Lang {
   try {
@@ -180,7 +195,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({
         previewStatus: "ok",
         previewInfo: info,
-        selectedItems: items.map((i) => i.id),
+        selectedItems: items.map((_, i) => i + 1),
       });
     } catch (e) {
       if (!isCurrentToken(token, previewToken)) return;
@@ -192,11 +207,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
-  toggleItem: (id) => {
-    const cur = get().selectedItems;
-    set({ selectedItems: cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id] });
+  toggleItem: (index) => {
+    const cur = new Set(get().selectedItems);
+    if (cur.has(index)) cur.delete(index);
+    else cur.add(index);
+    set({ selectedItems: [...cur] });
   },
-  setAllItems: (ids, on) => set({ selectedItems: on ? ids : [] }),
+  setAllItems: (indices, on) => set({ selectedItems: on ? indices : [] }),
   selectFormat: (id) => set({ selectedFormat: id }),
 
   tasks: [],
@@ -206,30 +223,44 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   bindTaskEvents: async () => {
     if (eventsBound) return;
-    eventsBound = true;
-    await listen<TaskPayload>("task_updated", (e) => {
-      const p = e.payload;
-      set((s) => {
-        const prev = s.tasks.find((t) => t.id === p.id);
-        const row = mergeTask(prev, p);
-        return { tasks: [row, ...s.tasks.filter((t) => t.id !== p.id)] };
-      });
-    });
-    await listen<{ id: string; line: string }>("task_log", (e) => {
-      set((s) => {
-        const byId = s.logs.filter((l) => l.id === e.payload.id);
-        const others = s.logs.filter((l) => l.id !== e.payload.id);
-        const nextFor = [...byId, e.payload].slice(-200);
-        return { logs: [...others, ...nextFor].slice(-800) };
-      });
-    });
     try {
-      const existing = await listTasks();
-      if (existing.length) {
-        set({ tasks: existing });
+      const u1 = await listen<TaskPayload>("task_updated", (e) => {
+        const p = e.payload;
+        set((s) => {
+          const known = new Set(s.tasks.map((t) => t.id));
+          if (!acceptTaskUpdate(known, p.id)) return s;
+          const prev = s.tasks.find((t) => t.id === p.id);
+          const row = mergeTask(prev, p);
+          return { tasks: [row, ...s.tasks.filter((t) => t.id !== p.id)] };
+        });
+      });
+      let u2: () => void;
+      try {
+        u2 = await listen<{ id: string; line: string }>("task_log", (e) => {
+          set((s) => {
+            const byId = s.logs.filter((l) => l.id === e.payload.id);
+            const others = s.logs.filter((l) => l.id !== e.payload.id);
+            const nextFor = [...byId, e.payload].slice(-200);
+            return { logs: [...others, ...nextFor].slice(-800) };
+          });
+        });
+      } catch (err) {
+        u1();
+        throw err;
+      }
+      unlistenTaskUpdated = u1;
+      unlistenTaskLog = u2;
+      eventsBound = true;
+      try {
+        const existing = await listTasks();
+        if (existing.length) {
+          set({ tasks: existing });
+        }
+      } catch {
+        /* first launch */
       }
     } catch {
-      /* first launch */
+      clearTaskEventListeners();
     }
   },
 
@@ -257,7 +288,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   startDownload: async (task) => {
-    const id = crypto.randomUUID();
+    const id = String(crypto.randomUUID());
     const stub: TaskPayload = {
       id,
       url: task.url,
@@ -286,9 +317,43 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   enqueueUrls: async (raw, extra) => {
     const urls = splitUrls(raw);
-    for (const url of urls) {
-      const task = get().buildTaskFromOptions(url, extra);
-      await get().startDownload(task);
+    const o = get().options;
+    const s = get().settings;
+    const items = urls.map((url) => {
+      const task = extra?.kind
+        ? toolboxTask(url, extra.kind, {
+            outDir: o.outDir || s?.outDir,
+            proxy: o.proxy || s?.proxy || undefined,
+            cookiesBrowser: o.cookiesBrowser || s?.cookiesBrowser || undefined,
+            cookiesFile: o.cookiesFile || s?.cookiesFile || undefined,
+          })
+        : get().buildTaskFromOptions(url, extra);
+      return { id: String(crypto.randomUUID()), task };
+    });
+    const stubs: TaskPayload[] = items.map(({ id, task }) => ({
+      id,
+      url: task.url,
+      title: null,
+      status: "queued",
+      downloaded: 0,
+      total: 0,
+      speed: 0,
+      eta: 0,
+      filePath: null,
+      outputFiles: [],
+      error: null,
+      request: task,
+      kind: task.kind,
+    }));
+    set((st) => ({ tasks: [...stubs, ...st.tasks] }));
+    try {
+      await startTasks(items);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const ids = new Set(items.map((i) => i.id));
+      set((st) => ({
+        tasks: st.tasks.map((t) => (ids.has(t.id) ? { ...t, status: "failed", error: msg } : t)),
+      }));
     }
   },
 
@@ -296,8 +361,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   pause: (id) => pauseTask(id),
   resume: (id) => resumeTask(id),
   remove: async (id) => {
-    await removeTask(id);
     set((s) => ({ tasks: s.tasks.filter((t) => t.id !== id) }));
+    await removeTask(id);
   },
   retry: async (id) => {
     const row = get().tasks.find((t) => t.id === id);
@@ -328,17 +393,25 @@ export const useAppStore = create<AppState>((set, get) => ({
   settings: null,
   commandPreview: "",
   refreshCommand: async () => {
-    const url = get().previewUrl.trim();
-    if (!/^https?:\/\//i.test(url)) {
-      set({ commandPreview: "" });
-      return;
-    }
-    try {
-      const cmd = await buildCommand(get().buildTaskFromOptions(url));
-      set({ commandPreview: cmd });
-    } catch {
-      set({ commandPreview: "" });
-    }
+    if (commandTimer) clearTimeout(commandTimer);
+    commandTimer = setTimeout(() => {
+      const token = ++commandSeq;
+      const url = get().previewUrl.trim();
+      if (!/^https?:\/\//i.test(url)) {
+        set({ commandPreview: "" });
+        return;
+      }
+      void buildCommand(get().buildTaskFromOptions(url)).then(
+        (cmd) => {
+          if (!isCurrentToken(token, commandSeq)) return;
+          set({ commandPreview: cmd });
+        },
+        () => {
+          if (!isCurrentToken(token, commandSeq)) return;
+          set({ commandPreview: "" });
+        },
+      );
+    }, 200);
   },
   loadAllSettings: async () => {
     try {

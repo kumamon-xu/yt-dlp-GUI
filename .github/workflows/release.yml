@@ -15,45 +15,38 @@ permissions:
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  prepare:
-    name: Recreate nightly only
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-22.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-      - name: Delete previous nightly (never delete vX.Y.Z)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release delete nightly --cleanup-tag --yes || true
-
   verify-version:
     name: Version consistency
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - name: package.json / Cargo.toml / tauri.conf.json
+      - name: package.json / Cargo.toml / tauri.conf.json (+ tag)
         run: |
           python3 - <<'PY'
-          import json,re,pathlib,sys
+          import json,re,pathlib,os,sys
           pkg=json.load(open("package.json"))["version"]
           tauri=json.load(open("src-tauri/tauri.conf.json"))["version"]
           cargo=re.search(r'^version = "([^"]+)"', pathlib.Path("src-tauri/Cargo.toml").read_text(), re.M).group(1)
           print(pkg, cargo, tauri)
           if not (pkg==cargo==tauri):
               sys.exit("version mismatch")
+          ref_type=os.environ.get("GITHUB_REF_TYPE","")
+          ref_name=os.environ.get("GITHUB_REF_NAME","")
+          if ref_type=="tag":
+              expect="v"+pkg
+              if ref_name!=expect:
+                  sys.exit(f"tag {ref_name} != {expect}")
           PY
 
   release:
     name: ${{ matrix.name }}
-    needs: [prepare, verify-version]
-    if: always() && needs.verify-version.result == 'success' && (needs.prepare.result == 'success' || needs.prepare.result == 'skipped')
+    needs: [verify-version]
     permissions:
       contents: write
     strategy:
@@ -109,6 +102,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust_targets }}
+          components: rustfmt, clippy
 
       - uses: swatinem/rust-cache@v2
         with:
@@ -137,8 +131,17 @@ jobs:
       - name: Typecheck
         run: pnpm exec tsc --noEmit
 
+      - name: Frontend tests
+        run: pnpm test
+
+      - name: Cargo fmt
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
       - name: Cargo test
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
 
       - name: Build (for smoke)
         run: pnpm tauri build ${{ matrix.args }}
@@ -173,3 +176,18 @@ jobs:
           uploadUpdaterJson: false
           uploadUpdaterSignatures: false
           retryAttempts: 2
+
+      - name: Engines manifest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          MODE=lock
+          if [ "${{ github.ref_type }}" != "tag" ]; then MODE=latest; fi
+          SLUG=$(echo "${{ matrix.name }}" | tr ' ' '-')
+          OUT="engines-manifest-${SLUG}.json"
+          if command -v python3 >/dev/null; then PY=python3; else PY=python; fi
+          "$PY" scripts/write-engines-manifest.py --out "$OUT" --os "${{ runner.os }}" --arch "${{ matrix.engine_arch }}" --mode "$MODE" --label "${{ matrix.name }}"
+          TAG="${{ github.ref_type == 'tag' && github.ref_name || 'nightly' }}"
+          gh release upload "$TAG" "$OUT" --clobber

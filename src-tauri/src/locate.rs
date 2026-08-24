@@ -35,10 +35,9 @@ pub fn is_tool_file(p: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = p.metadata() {
-            return meta.permissions().mode() & 0o111 != 0;
-        }
-        return false;
+        p.metadata()
+            .map(|meta| meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
     }
     #[cfg(not(unix))]
     {
@@ -240,10 +239,32 @@ mod tests {
             !t.contains("gh release delete v"),
             "must never delete vX.Y.Z"
         );
-        assert!(t.contains("gh release delete nightly"));
+        assert!(
+            !t.contains("gh release delete nightly"),
+            "must not delete nightly before a successful matrix"
+        );
+        assert!(t.contains("ref_name!=expect") || t.contains("tag"));
+        assert!(t.contains("pnpm test"));
+        assert!(t.contains("clippy"));
         assert!(t.contains("-Lock") || t.contains("--lock"));
         assert!(t.contains("check-bundled-engines"));
         assert!(t.contains("prerelease:"));
+        assert!(t.contains("write-engines-manifest"));
+        assert!(t.contains("engines-manifest-"));
+        assert!(
+            t.contains("cargo test --manifest-path src-tauri/Cargo.toml --lib"),
+            "Windows bin tests double-link VERSION resources"
+        );
+        assert!(
+            !t.contains("engines-manifest.json --clobber || true"),
+            "manifest upload must fail the job"
+        );
+        let py = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/write-engines-manifest.py"),
+        )
+        .unwrap();
+        assert!(py.contains("lock_url"));
+        assert!(py.contains("latest_url"));
         let fetch = std::fs::read_to_string(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/fetch-engines.ps1"),
         )
@@ -257,6 +278,8 @@ mod tests {
         assert!(ci.contains("pnpm test"));
         assert!(ci.contains("clippy"));
         assert!(ci.contains("fmt"));
+        assert!(ci.contains("windows-latest"));
+        assert!(ci.contains("macos-latest"));
         let sh = std::fs::read_to_string(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/check-bundled-engines.sh"),
         )

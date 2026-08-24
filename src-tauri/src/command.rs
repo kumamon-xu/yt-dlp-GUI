@@ -141,8 +141,9 @@ pub fn build_preview_args(
         "--ignore-config".into(),
         "--no-color".into(),
         "--newline".into(),
-        "--windows-filenames".into(),
     ];
+    #[cfg(windows)]
+    a.push("--windows-filenames".into());
     if let Some(js) = js_runtime.filter(|s| !s.is_empty()) {
         a.push("--js-runtimes".into());
         a.push(js.to_string());
@@ -151,6 +152,8 @@ pub fn build_preview_args(
     a.push(url.to_string());
     a
 }
+
+pub const PREVIEW_PLAYLIST_END: u32 = 1000;
 
 pub fn build_preview_args_flat(
     url: &str,
@@ -161,10 +164,16 @@ pub fn build_preview_args_flat(
 ) -> Vec<String> {
     let mut a = build_preview_args(url, cookies_file, cookies_browser, proxy, js_runtime);
     a.insert(1, "--flat-playlist".into());
+    a.insert(2, "--playlist-end".into());
+    a.insert(3, PREVIEW_PLAYLIST_END.to_string());
     a
 }
 
 pub fn default_out_dir() -> String {
+    known_download_dir().unwrap_or_else(fallback_download_dir)
+}
+
+fn fallback_download_dir() -> String {
     #[cfg(windows)]
     {
         std::env::var("USERPROFILE")
@@ -179,11 +188,90 @@ pub fn default_out_dir() -> String {
     }
 }
 
+#[cfg(windows)]
+fn known_download_dir() -> Option<String> {
+    #[repr(C)]
+    struct Guid {
+        data1: u32,
+        data2: u16,
+        data3: u16,
+        data4: [u8; 8],
+    }
+    const FOLDERID_DOWNLOADS: Guid = Guid {
+        data1: 0x374D_E290,
+        data2: 0x123F,
+        data3: 0x4565,
+        data4: [0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B],
+    };
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHGetKnownFolderPath(
+            rfid: *const Guid,
+            dw_flags: u32,
+            h_token: isize,
+            ppsz_path: *mut *mut u16,
+        ) -> i32;
+    }
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoTaskMemFree(pv: *mut core::ffi::c_void);
+    }
+    unsafe {
+        let mut p: *mut u16 = std::ptr::null_mut();
+        let hr = SHGetKnownFolderPath(&FOLDERID_DOWNLOADS, 0, 0, &mut p);
+        if hr != 0 || p.is_null() {
+            return None;
+        }
+        let mut len = 0usize;
+        while *p.add(len) != 0 {
+            len += 1;
+        }
+        let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, len));
+        CoTaskMemFree(p.cast());
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn known_download_dir() -> Option<String> {
+    if let Ok(p) = std::env::var("XDG_DOWNLOAD_DIR") {
+        if !p.is_empty() {
+            return Some(p);
+        }
+    }
+    if let Ok(out) = std::process::Command::new("xdg-user-dir")
+        .arg("DOWNLOAD")
+        .output()
+    {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+/// Fill empty `out_dir` from Tauri Downloads (when `app` is set) or the known-folder default.
+pub fn resolve_out_dir(cfg: &TaskConfig, download_dir: Option<String>) -> String {
+    if !cfg.out_dir.is_empty() {
+        return cfg.out_dir.clone();
+    }
+    if let Some(p) = download_dir.filter(|s| !s.is_empty()) {
+        return p;
+    }
+    default_out_dir()
+}
+
 pub fn build_args(cfg: &TaskConfig) -> Vec<String> {
     let mut a: Vec<String> = vec![
         "--no-color".into(),
         "--newline".into(),
-        "--windows-filenames".into(),
         "--progress-delta".into(),
         "0.3".into(),
         "--progress-template".into(),
@@ -192,6 +280,8 @@ pub fn build_args(cfg: &TaskConfig) -> Vec<String> {
         FILE_PRINT.into(),
         "--ignore-config".into(),
     ];
+    #[cfg(windows)]
+    a.push("--windows-filenames".into());
 
     if let Some(ff) = cfg.ffmpeg_location.as_ref().filter(|s| !s.is_empty()) {
         a.push("--ffmpeg-location".into());
@@ -306,7 +396,7 @@ pub fn build_args(cfg: &TaskConfig) -> Vec<String> {
     if let Some(items) = &cfg.playlist_items {
         if !items.is_empty() {
             a.push("--playlist-items".into());
-            a.push(items.clone());
+            a.push(compress_playlist_items_str(items));
         }
     }
 
@@ -332,11 +422,178 @@ pub fn quote_arg(s: &str) -> String {
     }
 }
 
+#[allow(dead_code)]
 pub fn format_command(engine: &str, args: &[String]) -> String {
     std::iter::once(quote_arg(engine))
         .chain(args.iter().map(|a| quote_arg(a)))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Compress `1,2,3,5,8,9,10` → `1-3,5,8-10`.
+pub fn compress_playlist_items_str(raw: &str) -> String {
+    let mut nums: Vec<u32> = raw
+        .split(',')
+        .flat_map(|part| {
+            let part = part.trim();
+            if let Some((a, b)) = part.split_once('-') {
+                let a: u32 = a.trim().parse().unwrap_or(0);
+                let b: u32 = b.trim().parse().unwrap_or(0);
+                if a == 0 || b == 0 {
+                    return Vec::new();
+                }
+                let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                return (lo..=hi).collect();
+            }
+            part.parse::<u32>()
+                .ok()
+                .filter(|n| *n > 0)
+                .into_iter()
+                .collect()
+        })
+        .collect();
+    nums.sort_unstable();
+    nums.dedup();
+    compress_playlist_items(&nums)
+}
+
+pub fn compress_playlist_items(indices: &[u32]) -> String {
+    if indices.is_empty() {
+        return String::new();
+    }
+    let mut out = Vec::new();
+    let mut start = indices[0];
+    let mut prev = indices[0];
+    for &n in &indices[1..] {
+        if n == prev + 1 {
+            prev = n;
+            continue;
+        }
+        out.push(if start == prev {
+            start.to_string()
+        } else {
+            format!("{start}-{prev}")
+        });
+        start = n;
+        prev = n;
+    }
+    out.push(if start == prev {
+        start.to_string()
+    } else {
+        format!("{start}-{prev}")
+    });
+    out.join(",")
+}
+
+pub fn apply_kind_constraints(cfg: &mut TaskConfig, kind: TaskKind) {
+    match kind {
+        TaskKind::Subtitles => {
+            cfg.skip_download = true;
+            cfg.write_subs = true;
+            if cfg
+                .convert_subs
+                .as_ref()
+                .map(|s| s.is_empty())
+                .unwrap_or(true)
+            {
+                cfg.convert_subs = Some("srt".into());
+            }
+            cfg.write_thumbnail = false;
+            cfg.write_info_json = false;
+            cfg.embed_thumbnail = false;
+            cfg.embed_metadata = false;
+            cfg.sponsorblock = false;
+        }
+        TaskKind::Thumbnail => {
+            cfg.skip_download = true;
+            cfg.write_thumbnail = true;
+            cfg.write_subs = false;
+            cfg.write_info_json = false;
+            cfg.embed_thumbnail = false;
+            cfg.embed_metadata = false;
+            cfg.sponsorblock = false;
+        }
+        TaskKind::Metadata => {
+            cfg.skip_download = true;
+            cfg.write_info_json = true;
+            cfg.write_subs = false;
+            cfg.write_thumbnail = false;
+            cfg.embed_thumbnail = false;
+            cfg.embed_metadata = false;
+            cfg.sponsorblock = false;
+        }
+        TaskKind::Audio | TaskKind::Video => {}
+    }
+}
+
+pub fn apply_settings(task: &mut NewTask, s: &crate::config::GlobalSettings) {
+    if task.out_dir.as_ref().map(|x| x.is_empty()).unwrap_or(true) && !s.out_dir.is_empty() {
+        task.out_dir = Some(s.out_dir.clone());
+    }
+    if task
+        .out_template
+        .as_ref()
+        .map(|x| x.is_empty())
+        .unwrap_or(true)
+        && !s.out_template.is_empty()
+    {
+        task.out_template = Some(s.out_template.clone());
+    }
+    if task.concurrent_fragments.is_none() {
+        task.concurrent_fragments = Some(s.concurrent_fragments);
+    }
+    if task
+        .limit_rate
+        .as_ref()
+        .map(|x| x.is_empty())
+        .unwrap_or(true)
+    {
+        task.limit_rate = s.limit_rate.clone();
+    }
+    if task
+        .cookies_file
+        .as_ref()
+        .map(|x| x.is_empty())
+        .unwrap_or(true)
+    {
+        task.cookies_file = s.cookies_file.clone();
+    }
+    if task
+        .cookies_browser
+        .as_ref()
+        .map(|x| x.is_empty())
+        .unwrap_or(true)
+    {
+        task.cookies_browser = s.cookies_browser.clone();
+    }
+    if task.proxy.as_ref().map(|x| x.is_empty()).unwrap_or(true) {
+        task.proxy = s.proxy.clone();
+    }
+    if task
+        .merge_format
+        .as_ref()
+        .map(|x| x.is_empty())
+        .unwrap_or(true)
+    {
+        task.merge_format = Some(s.merge_format.clone());
+    }
+}
+
+pub fn resolve_effective_config(
+    mut task: NewTask,
+    settings: &crate::config::GlobalSettings,
+) -> TaskConfig {
+    apply_settings(&mut task, settings);
+    let kind = task.kind;
+    let mut cfg = task.to_config();
+    if let Some(k) = kind {
+        apply_kind_constraints(&mut cfg, k);
+    }
+    cfg
+}
+
+pub fn needs_ffmpeg(cfg: &TaskConfig) -> bool {
+    cfg.preset.is_audio_extract() || (!cfg.skip_download && !cfg.preset.is_audio_extract())
 }
 
 fn default_preset_str() -> String {
@@ -562,6 +819,28 @@ mod tests {
     }
 
     #[test]
+    fn resolve_out_dir_fills_known_folder_before_paths() {
+        let mut c = base();
+        c.out_dir.clear();
+        assert_eq!(
+            resolve_out_dir(&c, Some("/known/Downloads".into())),
+            "/known/Downloads"
+        );
+        c.out_dir = "/explicit".into();
+        assert_eq!(
+            resolve_out_dir(&c, Some("/known/Downloads".into())),
+            "/explicit"
+        );
+        c.out_dir.clear();
+        let filled = resolve_out_dir(&c, None);
+        c.out_dir = filled.clone();
+        let a = build_args(&c);
+        assert_eq!(after(&a, "--paths"), filled);
+        assert_ne!(filled, ".");
+        assert!(!filled.is_empty());
+    }
+
+    #[test]
     fn empty_preset_defaults_to_mp4() {
         let t = NewTask {
             url: "https://x".into(),
@@ -634,6 +913,72 @@ mod tests {
         let a = build_preview_args_flat("https://x", None, None, None, None);
         assert_eq!(a[0], "-J");
         assert_eq!(a[1], "--flat-playlist");
+        assert_eq!(after(&a, "--playlist-end"), "1000");
         assert_eq!(a.last().unwrap(), "https://x");
+    }
+
+    #[test]
+    fn compress_playlist_ranges() {
+        assert_eq!(
+            compress_playlist_items(&[1, 2, 3, 5, 8, 9, 10]),
+            "1-3,5,8-10"
+        );
+        assert_eq!(compress_playlist_items_str("1,2,3,4,5,6,7"), "1-7");
+        assert_eq!(compress_playlist_items_str("1-3,5"), "1-3,5");
+    }
+
+    #[test]
+    fn metadata_kind_drops_subs_and_sponsor() {
+        let mut c = base();
+        c.write_subs = true;
+        c.sponsorblock = true;
+        c.embed_thumbnail = true;
+        apply_kind_constraints(&mut c, TaskKind::Metadata);
+        let a = build_args(&c);
+        assert!(a.contains(&"--skip-download".into()));
+        assert!(a.contains(&"--write-info-json".into()));
+        assert!(!a.contains(&"--write-subs".into()));
+        assert!(!a.iter().any(|x| x == "--sponsorblock-remove"));
+        assert!(!a.contains(&"--embed-thumbnail".into()));
+    }
+
+    #[test]
+    fn effective_config_fills_merge_format_from_settings() {
+        let s = crate::config::GlobalSettings {
+            merge_format: "mkv".into(),
+            ..Default::default()
+        };
+        let t = NewTask {
+            url: "https://x".into(),
+            preset: "mp4".into(),
+            custom_format: None,
+            audio_quality: None,
+            merge_format: None,
+            out_dir: None,
+            out_template: None,
+            concurrent_fragments: None,
+            limit_rate: None,
+            cookies_browser: None,
+            cookies_file: None,
+            proxy: None,
+            embed_thumbnail: None,
+            embed_metadata: None,
+            write_subs: None,
+            sub_langs: None,
+            embed_subs: None,
+            sponsorblock: None,
+            no_playlist: None,
+            playlist_items: None,
+            resume: None,
+            skip_download: None,
+            write_thumbnail: None,
+            convert_subs: None,
+            write_info_json: None,
+            kind: None,
+        };
+        let cfg = resolve_effective_config(t, &s);
+        assert_eq!(cfg.merge_format, "mkv");
+        let a = build_args(&cfg);
+        assert_eq!(after(&a, "--merge-output-format"), "mkv");
     }
 }

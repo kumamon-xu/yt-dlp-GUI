@@ -46,8 +46,14 @@ function StatusChip({ label, status, checking }: { label: string; status: ToolSt
 }
 
 export default function App() {
-  const { engine, ffmpeg, jsRuntime, checking, refresh, bindTaskEvents, loadAllSettings, setSettingsOpen } =
-    useAppStore();
+  const engine = useAppStore((s) => s.engine);
+  const ffmpeg = useAppStore((s) => s.ffmpeg);
+  const jsRuntime = useAppStore((s) => s.jsRuntime);
+  const checking = useAppStore((s) => s.checking);
+  const refresh = useAppStore((s) => s.refresh);
+  const bindTaskEvents = useAppStore((s) => s.bindTaskEvents);
+  const loadAllSettings = useAppStore((s) => s.loadAllSettings);
+  const setSettingsOpen = useAppStore((s) => s.setSettingsOpen);
   const t = useT();
 
   useEffect(() => {

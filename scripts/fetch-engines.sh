@@ -61,6 +61,17 @@ PY
 YTDLP="$CODE/yt-dlp"
 FFMPEG="$CODE/ffmpeg"
 
+if [[ "$FORCE" != "1" && -x "$YTDLP" && -x "$FFMPEG" ]]; then
+  yt_sz=$(wc -c < "$YTDLP" | tr -d ' ')
+  ff_sz=$(wc -c < "$FFMPEG" | tr -d ' ')
+  if [[ "$yt_sz" -gt 1000000 && "$ff_sz" -gt 1000000 ]]; then
+    echo "engines already in $CODE (pass --force to re-download)"
+    "$YTDLP" --version | head -n1
+    "$FFMPEG" -version | head -n1
+    exit 0
+  fi
+fi
+
 yt_key="$OS-$ARCH"
 [[ "$OS" == macos ]] && yt_key=macos
 ff_key="$OS-$ARCH"

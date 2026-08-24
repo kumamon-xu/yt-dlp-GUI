@@ -30,6 +30,8 @@ export default function SettingsPage() {
   const [msg, setMsg] = useState("");
   const [draft, setDraft] = useState<GlobalSettings>(emptySettings());
   const [err, setErr] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [updating, setUpdating] = useState(false);
 
   useEffect(() => {
     if (open) {
@@ -136,15 +138,18 @@ export default function SettingsPage() {
           {err && <p className="text-xs text-red-400">{err}</p>}
           <div className="flex gap-2">
             <button
-              disabled={!dirty}
+              disabled={!dirty || saving}
               className="rounded-md bg-sky-600 px-3 py-1.5 text-xs text-white hover:bg-sky-500 disabled:opacity-40"
               onClick={async () => {
                 setErr("");
+                setSaving(true);
                 try {
                   await persist(draft);
                   setMsg(t("settings.saved"));
                 } catch (e) {
                   setErr(String(e));
+                } finally {
+                  setSaving(false);
                 }
               }}
             >
@@ -161,14 +166,18 @@ export default function SettingsPage() {
             </button>
           </div>
           <button
-            className="rounded-md border border-slate-700 px-3 py-1.5 text-xs text-slate-200 hover:bg-slate-800"
+            disabled={updating}
+            className="rounded-md border border-slate-700 px-3 py-1.5 text-xs text-slate-200 hover:bg-slate-800 disabled:opacity-40"
             onClick={async () => {
               setMsg("…");
+              setUpdating(true);
               try {
                 const r = await updateEngine();
                 setMsg(r.message || `${r.oldVersion ?? "?"} → ${r.newVersion ?? "?"}`);
               } catch (e) {
                 setMsg(String(e));
+              } finally {
+                setUpdating(false);
               }
             }}
           >

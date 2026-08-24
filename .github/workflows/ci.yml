@@ -89,3 +89,37 @@ jobs:
 
       - name: Cargo test
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  cargo-windows:
+    name: cargo test (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+      - name: Placeholder engines
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path code | Out-Null
+          Set-Content -Path code/yt-dlp.exe -Value ""
+          Set-Content -Path code/ffmpeg.exe -Value ""
+      - name: Cargo test
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+  cargo-macos:
+    name: cargo check (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+      - name: Placeholder engines
+        run: mkdir -p code && : > code/yt-dlp && : > code/ffmpeg && chmod +x code/yt-dlp code/ffmpeg
+      - name: Cargo check
+        run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets

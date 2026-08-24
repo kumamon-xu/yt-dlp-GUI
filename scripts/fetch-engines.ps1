@@ -31,6 +31,15 @@ if ($Lock) { $useLock = $true }
 $Ytdlp = Join-Path $Code "yt-dlp.exe"
 $Ffmpeg = Join-Path $Code "ffmpeg.exe"
 
+if (-not $Force -and (Test-Path $Ytdlp) -and (Test-Path $Ffmpeg)) {
+    if ((Get-Item $Ytdlp).Length -gt 1MB -and (Get-Item $Ffmpeg).Length -gt 1MB) {
+        Write-Host "engines already in $Code (pass -Force to re-download)"
+        & $Ytdlp --version
+        & $Ffmpeg -version | Select-Object -First 1
+        exit 0
+    }
+}
+
 if ($useLock) {
     $lock = Get-Content $LockFile -Raw | ConvertFrom-Json
     $yt = $lock.'yt-dlp'.'windows-x64'

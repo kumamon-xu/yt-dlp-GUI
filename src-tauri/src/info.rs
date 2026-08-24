@@ -265,7 +265,25 @@ pub async fn get_info(
     if !out.status.success() {
         return Err(friendly_error(&String::from_utf8_lossy(&out.stderr)));
     }
-    parse_info_json(&String::from_utf8_lossy(&out.stdout))
+    const PREVIEW_MAX_STDOUT: usize = 8 * 1024 * 1024;
+    if out.stdout.len() > PREVIEW_MAX_STDOUT {
+        return Err(format!(
+            "预览结果过大（{} MB），请缩小播放列表或使用 --playlist-end",
+            out.stdout.len() / (1024 * 1024)
+        ));
+    }
+    let info = parse_info_json(&String::from_utf8_lossy(&out.stdout))?;
+    Ok(cap_playlist(info))
+}
+
+pub fn cap_playlist(mut info: VideoInfo) -> VideoInfo {
+    if let Some(ref mut pl) = info.playlist {
+        let max = crate::command::PREVIEW_PLAYLIST_END as usize;
+        if pl.len() > max {
+            pl.truncate(max);
+        }
+    }
+    info
 }
 
 #[cfg(test)]
@@ -344,6 +362,26 @@ mod tests {
         assert!(info.is_playlist);
         assert_eq!(info.playlist.as_ref().unwrap().len(), 1000);
         assert!(info.formats.is_empty());
+    }
+
+    #[test]
+    fn cap_playlist_truncates_to_preview_limit() {
+        let n = crate::command::PREVIEW_PLAYLIST_END as usize + 20;
+        let mut entries = String::new();
+        for i in 0..n {
+            if i > 0 {
+                entries.push(',');
+            }
+            entries.push_str(&format!(r#"{{"id":"v{i}","title":"t{i}"}}"#));
+        }
+        let raw = format!(
+            r#"{{"_type":"playlist","id":"PL","title":"s","playlist_count":{n},"entries":[{entries}]}}"#
+        );
+        let info = cap_playlist(parse_info_json(&raw).unwrap());
+        assert_eq!(
+            info.playlist.as_ref().unwrap().len(),
+            crate::command::PREVIEW_PLAYLIST_END as usize
+        );
     }
 
     #[test]

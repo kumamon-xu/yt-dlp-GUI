@@ -140,6 +140,8 @@ export interface GlobalSettings {
 }
 
 export const startTask = (id: string, task: NewTask) => invoke<void>("start_task", { id, task });
+export const startTasks = (items: { id: string; task: NewTask }[]) =>
+  invoke<void>("start_tasks", { items });
 export const cancelTask = (id: string) => invoke<void>("cancel_task", { id });
 export const pauseTask = (id: string) => invoke<void>("pause_task", { id });
 export const resumeTask = (id: string) => invoke<void>("resume_task", { id });
@@ -190,4 +192,70 @@ export function retryTaskRequest(row: { url: string; request: NewTask }): NewTas
 
 export function isCurrentToken(token: number, latest: number): boolean {
   return token === latest;
+}
+
+export function canCancelStatus(status: TaskStatus): boolean {
+  return status === "queued" || status === "starting" || status === "downloading" || status === "postprocess";
+}
+
+export function canRemoveStatus(status: TaskStatus): boolean {
+  return status === "queued" || status === "paused" || status === "done" || status === "failed" || status === "canceled";
+}
+
+export function acceptTaskUpdate(knownIds: Set<string>, id: string): boolean {
+  return knownIds.has(id);
+}
+
+export function compressPlaylistItems(indices: number[]): string {
+  const nums = [...new Set(indices.filter((n) => n > 0))].sort((a, b) => a - b);
+  if (!nums.length) return "";
+  const parts: string[] = [];
+  let start = nums[0];
+  let prev = nums[0];
+  for (let i = 1; i < nums.length; i++) {
+    const n = nums[i];
+    if (n === prev + 1) {
+      prev = n;
+      continue;
+    }
+    parts.push(start === prev ? String(start) : `${start}-${prev}`);
+    start = n;
+    prev = n;
+  }
+  parts.push(start === prev ? String(start) : `${start}-${prev}`);
+  return parts.join(",");
+}
+
+export function redactUserinfo(s: string): string {
+  const i = s.indexOf("://");
+  if (i < 0) return s;
+  const rest = s.slice(i + 3);
+  const at = rest.indexOf("@");
+  if (at < 0) return s;
+  const creds = rest.slice(0, at);
+  const colon = creds.indexOf(":");
+  if (colon < 0) return s;
+  return `${s.slice(0, i + 3)}${creds.slice(0, colon)}:***${rest.slice(at)}`;
+}
+
+export function toolboxTask(
+  url: string,
+  kind: TaskKind,
+  net: Pick<NewTask, "outDir" | "proxy" | "cookiesBrowser" | "cookiesFile">,
+): NewTask {
+  return {
+    url,
+    preset: "mp4",
+    kind,
+    noPlaylist: true,
+    skipDownload: true,
+    writeSubs: kind === "subtitles",
+    convertSubs: kind === "subtitles" ? "srt" : undefined,
+    writeThumbnail: kind === "thumbnail",
+    writeInfoJson: kind === "metadata",
+    outDir: net.outDir,
+    proxy: net.proxy,
+    cookiesBrowser: net.cookiesBrowser,
+    cookiesFile: net.cookiesFile,
+  };
 }

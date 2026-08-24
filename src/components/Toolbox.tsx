@@ -6,9 +6,9 @@ export default function Toolbox() {
   const url = useAppStore((s) => s.previewUrl);
   const enqueue = useAppStore((s) => s.enqueueUrls);
 
-  const run = (extra: Parameters<typeof enqueue>[1]) => {
+  const run = (kind: "subtitles" | "thumbnail" | "metadata") => {
     if (!url) return;
-    void enqueue(url, extra);
+    void enqueue(url, { kind });
   };
 
   const btn = "flex flex-1 items-center justify-center gap-1.5 rounded-md border border-slate-700 px-2 py-1.5 text-xs text-slate-300 hover:bg-slate-800 disabled:opacity-40";
@@ -20,21 +20,21 @@ export default function Toolbox() {
         <button
           className={btn}
           disabled={!url}
-          onClick={() => run({ skipDownload: true, writeSubs: true, convertSubs: "srt", noPlaylist: true, kind: "subtitles" })}
+          onClick={() => run("subtitles")}
         >
           <Subtitles size={13} /> {t("tools.subs")}
         </button>
         <button
           className={btn}
           disabled={!url}
-          onClick={() => run({ skipDownload: true, writeThumbnail: true, noPlaylist: true, kind: "thumbnail" })}
+          onClick={() => run("thumbnail")}
         >
           <Image size={13} /> {t("tools.thumb")}
         </button>
         <button
           className={btn}
           disabled={!url}
-          onClick={() => run({ skipDownload: true, writeInfoJson: true, noPlaylist: true, kind: "metadata" })}
+          onClick={() => run("metadata")}
         >
           <FileJson size={13} /> {t("tools.meta")}
         </button>
