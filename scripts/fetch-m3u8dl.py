@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Fetch a native N_m3u8DL-RE release and verify the pinned archive and binary."""
 import argparse
+import gzip
 import hashlib
 import io
 import json
@@ -29,6 +30,15 @@ def download(url):
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def write_linux_payload(binary):
+    # linuxdeploy/patchelf rewrites NativeAOT executables and can make RE crash.
+    # Ship bytes as data, then verify and unpack them in the app's managed cache.
+    code = ROOT / "code"
+    code.mkdir(parents=True, exist_ok=True)
+    (code / f"{TOOL}.gz").write_bytes(gzip.compress(binary, mtime=0))
+    (code / f"{TOOL}.sha256").write_text(digest(binary) + "\n", encoding="ascii")
 
 
 def binary_from_archive(data, archive, member):
@@ -72,6 +82,8 @@ def main():
         if digest(license_data) != lock["licenseSha256"]:
             raise ValueError("N_m3u8DL-RE license hash mismatch")
         if not args.force and target.is_file() and digest(target.read_bytes()) == node["sha256"]:
+            if args.os == "linux":
+                write_linux_payload(target.read_bytes())
             print(f"{TOOL} already matches lock")
             return 0
     print(f"Downloading {node['url']}")
@@ -86,6 +98,8 @@ def main():
     staging.write_bytes(binary)
     staging.chmod(0o755)
     os.replace(staging, target)
+    if args.os == "linux":
+        write_linux_payload(binary)
     print(f"{TOOL} ready: {target}")
     return 0
 

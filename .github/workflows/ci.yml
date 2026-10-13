@@ -60,6 +60,8 @@ jobs:
           : > code/yt-dlp
           : > code/ffmpeg
           : > code/N_m3u8DL-RE
+          : > code/N_m3u8DL-RE.gz
+          : > code/N_m3u8DL-RE.sha256
           chmod +x code/yt-dlp code/ffmpeg code/N_m3u8DL-RE
 
       - name: Version consistency

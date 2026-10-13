@@ -91,6 +91,14 @@ pub fn locate_tool(
         if is_tool_file(&p) {
             return Ok((p, ToolSource::Bundled));
         }
+        #[cfg(target_os = "linux")]
+        if base == "N_m3u8DL-RE" && p.with_extension("gz").is_file() {
+            let managed = lookup
+                .managed_dir
+                .as_deref()
+                .ok_or_else(|| "无法获取 RE 的本地缓存目录".to_string())?;
+            return unpack_bundled_gzip(&p, managed).map(|path| (path, ToolSource::Bundled));
+        }
     }
 
     if let Some(dir) = &lookup.dev_code_dir {
@@ -109,6 +117,44 @@ pub fn locate_tool(
     Err(format!(
         "未找到 {base}：请将 {name} 放到安装资源 code/ 或在设置中指定路径"
     ))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn unpack_bundled_gzip(binary: &Path, managed: &Path) -> Result<PathBuf, String> {
+    use std::io::Read;
+    let expected = std::fs::read_to_string(binary.with_extension("sha256"))
+        .map_err(|e| format!("无法读取 RE 校验文件：{e}"))?
+        .trim()
+        .to_ascii_lowercase();
+    if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("RE 校验文件无效".into());
+    }
+    let name = binary.file_name().ok_or("RE 文件名无效")?;
+    let target = managed.join(format!("bundled-{expected}")).join(name);
+    if is_tool_file(&target) && check_hash(&target, &expected).is_ok() {
+        return Ok(target);
+    }
+    let file = std::fs::File::open(binary.with_extension("gz")).map_err(|e| e.to_string())?;
+    let mut data = Vec::new();
+    flate2::read::GzDecoder::new(file)
+        .take(128 * 1024 * 1024)
+        .read_to_end(&mut data)
+        .map_err(|e| format!("无法解压 RE：{e}"))?;
+    let mut sha = Sha256Wrap::new();
+    sha.update(&data);
+    if sha.finalize_hex() != expected {
+        return Err("RE 解压内容的 SHA-256 不匹配".into());
+    }
+    std::fs::create_dir_all(target.parent().ok_or("RE 缓存路径无效")?)
+        .map_err(|e| e.to_string())?;
+    crate::fsutil::atomic_write(&target, &data)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(target)
 }
 
 #[allow(dead_code)]
@@ -179,6 +225,47 @@ mod tests {
         let p = p.join(n.to_string());
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn bundled_gzip_preserves_bytes_repairs_cache_and_rejects_corruption() {
+        let root = tmp_dir();
+        let binary = root.join("code/N_m3u8DL-RE");
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        let data = b"#!/bin/sh\nprintf 'RE test version\\n'\n";
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).unwrap();
+        std::fs::write(binary.with_extension("gz"), encoder.finish().unwrap()).unwrap();
+        let mut sha = Sha256Wrap::new();
+        sha.update(data);
+        let expected = sha.finalize_hex();
+        std::fs::write(binary.with_extension("sha256"), &expected).unwrap();
+        let managed = root.join("managed");
+        let cached = unpack_bundled_gzip(&binary, &managed).unwrap();
+        assert_eq!(std::fs::read(&cached).unwrap(), data);
+        assert!(is_tool_file(&cached));
+        assert_eq!(unpack_bundled_gzip(&binary, &managed).unwrap(), cached);
+        std::fs::write(&cached, b"corrupted by a packager").unwrap();
+        assert_eq!(unpack_bundled_gzip(&binary, &managed).unwrap(), cached);
+        assert_eq!(std::fs::read(&cached).unwrap(), data);
+        #[cfg(target_os = "linux")]
+        {
+            let (located, source) = locate_tool(
+                "N_m3u8DL-RE",
+                None,
+                &ToolLookup {
+                    resource_dir: Some(root.clone()),
+                    managed_dir: Some(managed.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(located, cached);
+            assert_eq!(source, ToolSource::Bundled);
+        }
+        std::fs::write(binary.with_extension("sha256"), "0".repeat(64)).unwrap();
+        assert!(unpack_bundled_gzip(&binary, &managed).is_err());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn touch_exec(dir: &Path, name: &str) -> PathBuf {

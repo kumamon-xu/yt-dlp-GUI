@@ -127,6 +127,9 @@ def main():
             "version": first_line([str(p), "-version" if "ffmpeg" in n.lower() else "--version"]),
         }
         entry.update(lock_metadata(lock, tool, key))
+        payload = p.with_suffix(".gz")
+        if tool == "N_m3u8DL-RE" and args.os.lower().startswith("linux") and payload.is_file():
+            entry.update({"bundle_encoding": "gzip", "bundle_path": str(payload.relative_to(root)), "bundle_sha256": sha256(payload)})
         if args.mode == "latest":
             entry.update(latest_metadata(args.os, tool))
         engines.append(entry)

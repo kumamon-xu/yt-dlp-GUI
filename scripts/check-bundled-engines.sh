@@ -36,6 +36,11 @@ while IFS= read -r -d "" f; do
   fi
 done < <(find "$ROOT" -type f \( -name "$NAME_YT" -o -name "$NAME_FF" -o -name "$NAME_RE" \) -path "*/code/*" -print0 2>/dev/null)
 
+if [[ "$(uname -s)" == Linux ]]; then
+  python3 "$(dirname "${BASH_SOURCE[0]}")/check-bundled-m3u8dl.py" --root "$ROOT"
+  found_re=1
+fi
+
 if [[ "$found_yt" -eq 0 || "$found_ff" -eq 0 || "$found_re" -eq 0 ]]; then
   echo "need $NAME_YT, $NAME_FF and $NAME_RE under $ROOT/**/code/" >&2
   exit 1

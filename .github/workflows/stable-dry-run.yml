@@ -12,6 +12,7 @@ on:
       - "scripts/fetch-m3u8dl.py"
       - "scripts/test_fetch_m3u8dl.py"
       - "scripts/check-bundled-engines.*"
+      - "scripts/check-bundled-m3u8dl.py"
       - "scripts/collect-release-assets.py"
       - "scripts/prepare-release-assets.py"
       - "scripts/write-engines-manifest.py"

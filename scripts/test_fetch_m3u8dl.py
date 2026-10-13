@@ -1,5 +1,8 @@
 import importlib.util
+import gzip
+import hashlib
 import pathlib
+import tempfile
 import unittest
 from unittest import mock
 
@@ -30,6 +33,18 @@ class MetadataAuthenticationTests(unittest.TestCase):
 
     def test_local_download_works_without_authentication(self):
         self.assertIsNone(self.request_for("https://api.github.com/repos/test", {}).get_header("Authorization"))
+
+    def test_linux_payload_preserves_native_bytes_and_checksum(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(MODULE, "ROOT", pathlib.Path(directory)):
+            binary = b"\x7fELFnative-code-that-must-not-be-rewritten"
+            MODULE.write_linux_payload(binary)
+            code = pathlib.Path(directory) / "code"
+            archive = code / "N_m3u8DL-RE.gz"
+            original = archive.read_bytes()
+            self.assertEqual(gzip.decompress(original), binary)
+            self.assertEqual((code / "N_m3u8DL-RE.sha256").read_text().strip(), hashlib.sha256(binary).hexdigest())
+            MODULE.write_linux_payload(binary)
+            self.assertEqual(archive.read_bytes(), original)
 
 
 if __name__ == "__main__":

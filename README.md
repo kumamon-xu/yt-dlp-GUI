@@ -12,13 +12,14 @@ Windows, Linux, and macOS. Defaults to Chinese UI (English available). Optimized
 
 **Download:** [latest installer](https://github.com/kumamon-xu/yt-dlp-GUI/releases/latest)
 
-## v0.3.0 更新
+## v0.3.1 更新
 
 - 集成 N_m3u8DL-RE：支持 m3u8 直链、兼容的视频页面自动解析及 AES-128 HLS 下载。
 - 新增工具路径设置、状态检查、HLS 下载百分比及任务引擎标识。
 - 保留具体流 URL；无法准确映射的多轨选择继续由 yt-dlp 下载，避免改变编码、帧率或音轨。
 - 修复 HLS 限速换算：`1M` 表示 1 MiB/s。
 - 修复自动保存撤销会话预设、下载按钮覆盖面板预设，以及保存新目录后仍使用旧目录的问题。
+- 修复 Linux AppImage 打包改写 RE 原生程序导致的崩溃；Linux 使用经 SHA-256 校验的压缩资源，运行时解压到本地缓存，保留原始程序字节。
 
 ---
 
@@ -108,8 +109,8 @@ The packaged app copies `code/yt-dlp`, `code/ffmpeg`, and `code/N_m3u8DL-RE` as 
 
 ```bash
 # bump package.json, src-tauri/Cargo.toml, src-tauri/Cargo.lock and src-tauri/tauri.conf.json
-git tag -a v0.3.0 -m "yt-dlp GUI v0.3.0"
-git push origin v0.3.0
+git tag -a v0.3.1 -m "yt-dlp GUI v0.3.1"
+git push origin v0.3.1
 ```
 
 CI downloads platform-native yt-dlp + ffmpeg + N_m3u8DL-RE into `code/` before `tauri build`. Installers are unsigned (Windows SmartScreen / macOS Gatekeeper may warn). To sign macOS builds, add `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, and related secrets to the repository, then expose them to the reusable build workflow's installer step.
