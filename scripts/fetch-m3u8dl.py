@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import tarfile
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -15,7 +16,13 @@ TOOL = "N_m3u8DL-RE"
 
 
 def download(url):
-    request = urllib.request.Request(url, headers={"User-Agent": "yt-dlp-GUI"})
+    headers = {"User-Agent": "yt-dlp-GUI"}
+    parsed = urllib.parse.urlsplit(url)
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    # Authenticate metadata calls on CI without forwarding credentials to asset hosts.
+    if token and parsed.scheme == "https" and parsed.hostname == "api.github.com" and parsed.port in (None, 443):
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request, timeout=120) as response:
         return response.read()
 

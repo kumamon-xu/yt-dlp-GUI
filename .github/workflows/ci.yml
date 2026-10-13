@@ -74,7 +74,7 @@ jobs:
           PY
 
       - name: Release script tests
-        run: python3 -m unittest scripts/test_prepare_release_assets.py
+        run: python3 -m unittest scripts/test_prepare_release_assets.py scripts/test_fetch_m3u8dl.py
 
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile

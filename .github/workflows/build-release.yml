@@ -103,6 +103,8 @@ jobs:
       - name: Fetch locked/latest engines (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if ("${{ inputs.fetch_mode }}" -eq "lock") {
             ./scripts/fetch-engines.ps1 -Force -Lock
@@ -113,6 +115,8 @@ jobs:
       - name: Fetch locked/latest engines (Unix)
         if: runner.os != 'Windows'
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ "${{ inputs.fetch_mode }}" = "lock" ]; then
             bash scripts/fetch-engines.sh --force --lock --arch "${{ matrix.engine_arch }}"
