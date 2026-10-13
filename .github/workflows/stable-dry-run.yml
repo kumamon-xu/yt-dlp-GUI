@@ -9,6 +9,7 @@ on:
       - ".github/workflows/stable-dry-run.yml"
       - "engines.lock.json"
       - "scripts/fetch-engines.*"
+      - "scripts/fetch-m3u8dl.py"
       - "scripts/check-bundled-engines.*"
       - "scripts/collect-release-assets.py"
       - "scripts/prepare-release-assets.py"

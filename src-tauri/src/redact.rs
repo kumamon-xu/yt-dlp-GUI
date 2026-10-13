@@ -31,10 +31,15 @@ pub fn strip_userinfo(s: &str) -> String {
 
 pub fn format_command_preview(engine: &str, args: &[String]) -> String {
     std::iter::once(crate::command::quote_arg(engine))
-        .chain(
-            args.iter()
-                .map(|a| crate::command::quote_arg(&redact_userinfo(a))),
-        )
+        .chain(args.iter().map(|a| {
+            let lower = a.to_ascii_lowercase();
+            let display = if lower.starts_with("cookie:") || lower.starts_with("authorization:") {
+                format!("{}: ***", a.split(':').next().unwrap_or("Header"))
+            } else {
+                redact_userinfo(a)
+            };
+            crate::command::quote_arg(&display)
+        }))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -70,6 +75,19 @@ mod tests {
         ];
         let preview = format_command_preview("yt-dlp", &args);
         assert!(!preview.contains("secret"), "{preview}");
+        assert!(args[1].contains("secret"));
+    }
+
+    #[test]
+    fn preview_masks_re_authentication_headers() {
+        let args = vec![
+            "--header".into(),
+            "Cookie: sid=secret".into(),
+            "--header".into(),
+            "Authorization: Bearer secret".into(),
+        ];
+        let preview = format_command_preview("N_m3u8DL-RE", &args);
+        assert!(!preview.contains("secret"));
         assert!(args[1].contains("secret"));
     }
 }

@@ -62,5 +62,48 @@
       "licenseNoticeUrl": "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/darwin-arm64.LICENSE",
       "sourceUrl": "https://www.osxexperts.net/"
     }
+  },
+  "N_m3u8DL-RE": {
+    "macos-arm64": {
+      "archive": "tar.gz",
+      "sha256": "c332b463aa42975c25217d56a51a2ea32fddfd86b4ae8338a8f7416b0bc196e7",
+      "url": "https://github.com/nilaoda/N_m3u8DL-RE/releases/download/v0.6.0-beta/N_m3u8DL-RE_v0.6.0-beta_osx-arm64_20260629.tar.gz",
+      "member": "N_m3u8DL-RE",
+      "archiveSha256": "ca181b7e8976564766c34e3cefe48fff409f58289ca970ade062668c01c53918"
+    },
+    "licenseFile": "licenses/N_m3u8DL-RE-MIT.txt",
+    "licenseUrl": "https://github.com/nilaoda/N_m3u8DL-RE/blob/v0.6.0-beta/LICENSE",
+    "windows-x64": {
+      "archive": "zip",
+      "sha256": "35e7c16983f0315bba2a3f37dc392fdfa074be614c8effb642b78376b18ba272",
+      "url": "https://github.com/nilaoda/N_m3u8DL-RE/releases/download/v0.6.0-beta/N_m3u8DL-RE_v0.6.0-beta_win-x64_20260629.zip",
+      "member": "N_m3u8DL-RE.exe",
+      "archiveSha256": "3825fd42ee502f98a9378f6fdddb2f7822709f521806214f466db6935c950f1a"
+    },
+    "linux-arm64": {
+      "archive": "tar.gz",
+      "sha256": "c3f0bef7860dadb0ccbcbc6d206d19af0a0c8e74780f937b213784e5e7aa32dd",
+      "url": "https://github.com/nilaoda/N_m3u8DL-RE/releases/download/v0.6.0-beta/N_m3u8DL-RE_v0.6.0-beta_linux-arm64_20260629.tar.gz",
+      "member": "N_m3u8DL-RE",
+      "archiveSha256": "17f3c2c2372cbb859bf42e77bf59f7a049e5642fc4f6d234195e70bbea178299"
+    },
+    "licenseSha256": "99c39a1a78cd3d844f336576c18645e7334d2d5034713e961973591149536081",
+    "sourceUrl": "https://github.com/nilaoda/N_m3u8DL-RE/tree/v0.6.0-beta",
+    "macos-x64": {
+      "archive": "tar.gz",
+      "sha256": "8d4ce04c28f0fa9e2aea9c53af2a5895882f353e12425c5c3fcafaa4370a216a",
+      "url": "https://github.com/nilaoda/N_m3u8DL-RE/releases/download/v0.6.0-beta/N_m3u8DL-RE_v0.6.0-beta_osx-x64_20260629.tar.gz",
+      "member": "N_m3u8DL-RE",
+      "archiveSha256": "4dab8d256ae3164557f48a3326c8fa60da99e37536ee1589ce6c841180fa8204"
+    },
+    "license": "MIT",
+    "version": "v0.6.0-beta",
+    "linux-x64": {
+      "archive": "tar.gz",
+      "sha256": "87e5bf963d9c1a72aee8eb5a75edbe398de2b00ec209b595f621ac6a9c344186",
+      "url": "https://github.com/nilaoda/N_m3u8DL-RE/releases/download/v0.6.0-beta/N_m3u8DL-RE_v0.6.0-beta_linux-x64_20260629.tar.gz",
+      "member": "N_m3u8DL-RE",
+      "archiveSha256": "2ebcd450594a08c0de0bcd502a80c5d3f89a702a0fa6604199527bb8d6eee4db"
+    }
   }
 }

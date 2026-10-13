@@ -60,6 +60,7 @@ export interface VideoInfo {
 
 export const checkEngine = () => invoke<ToolStatus>("check_engine");
 export const checkFfmpeg = () => invoke<ToolStatus>("check_ffmpeg");
+export const checkM3u8dl = () => invoke<ToolStatus>("check_m3u8dl");
 export const checkJsRuntime = () => invoke<ToolStatus>("check_js_runtime");
 export const getEnginePath = () => invoke<string | null>("engine_path");
 export const getFfmpegPath = () => invoke<string | null>("ffmpeg_path");
@@ -118,6 +119,8 @@ export interface TaskPayload {
   total: number;
   speed: number;
   eta: number;
+  progress?: number | null;
+  downloadEngine?: "ytDlp" | "m3u8dl" | null;
   filePath: string | null;
   outputFiles?: string[];
   error: string | null;
@@ -138,6 +141,8 @@ export interface GlobalSettings {
   proxy: string | null;
   enginePath: string | null;
   ffmpegPath: string | null;
+  m3u8dlPath?: string | null;
+  useM3u8dl?: boolean;
   mergeFormat: string;
 }
 

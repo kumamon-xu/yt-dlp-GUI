@@ -1,4 +1,4 @@
-# Download yt-dlp.exe + ffmpeg.exe into code/.
+# Download yt-dlp.exe + ffmpeg.exe + N_m3u8DL-RE.exe into code/.
 #   -Lock    engines.lock.json (Stable, default in CI tags)
 #   -Latest  ignore lock (Nightly)
 param(
@@ -54,6 +54,11 @@ if ($useLock) {
 
 $Ytdlp = Join-Path $Code "yt-dlp.exe"
 $Ffmpeg = Join-Path $Code "ffmpeg.exe"
+$m3u8Mode = if ($useLock) { "lock" } else { "latest" }
+$m3u8Args = @((Join-Path $PSScriptRoot "fetch-m3u8dl.py"), "--os", "windows", "--arch", "x64", "--mode", $m3u8Mode)
+if ($Force) { $m3u8Args += "--force" }
+& python @m3u8Args
+if ($LASTEXITCODE -ne 0) { throw "N_m3u8DL-RE fetch failed ($LASTEXITCODE)" }
 
 if (-not $Force -and (Test-Path $Ytdlp) -and (Test-Path $Ffmpeg)) {
     if ((Get-Item $Ytdlp).Length -gt 1MB -and (Get-Item $Ffmpeg).Length -gt 1MB) {

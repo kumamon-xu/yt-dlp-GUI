@@ -1,18 +1,32 @@
 # Dependencies
 node_modules
 .pnpm-store
+.npm/
+.yarn/cache/
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.venv/
+venv/
 
 # Frontend build
 dist
 dist-ssr
 *.local
+coverage/
+.vite/
+*.tsbuildinfo
 
 # Rust / Tauri
 src-tauri/target
 src-tauri/gen/schemas
 **/*.pdb
+/target/
+/release-upload/
+/downloaded-artifacts/
+/publish/
+/artifacts/
+/build/
 
 # Bundled engines — download into code/ locally (see README)
 code/*
@@ -38,6 +52,20 @@ lerna-debug.log*
 .env
 .env.*
 !.env.example
+cookies*.txt
+cookies*.json
+*.cookies
+cookies-*.tmp
+settings.json
+settings.corrupt-*.json
+queue.json
+*.har
+*.pem
+*.key
+*.pfx
+*.p12
+*.jks
+*.keystore
 
 # Editor
 .vscode/*
@@ -53,5 +81,35 @@ lerna-debug.log*
 # OS
 .DS_Store
 *.orig
+*.tmp
+*.bak
 
-docs
+# Local working notes and agent/browser state
+/docs/
+/notes/
+/scratch/
+/.codex/
+/.agents/
+/.cache/
+/.playwright-cli/
+/playwright-report/
+/test-results/
+
+# Downloaded media and HLS work files (not source assets)
+/downloads/
+**/.m3u8dl/
+*.mp4
+*.mkv
+*.webm
+*.avi
+*.mov
+*.m4a
+*.mp3
+*.aac
+*.flac
+*.wav
+*.m3u8
+*.mpd
+*.part
+*.ytdl
+*.info.json

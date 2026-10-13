@@ -203,6 +203,26 @@ pub async fn get_info(
         kill_process_tree(old);
     }
 
+    // RE can handle manifests that yt-dlp cannot inspect. Direct HLS downloads do not
+    // need a successful yt-dlp preview (or even an installed yt-dlp executable).
+    if settings.use_m3u8dl && crate::m3u8::is_m3u8_url(&url) {
+        let source = crate::m3u8::direct_source(&url);
+        return Ok(VideoInfo {
+            id: source.title.clone(),
+            title: source.title,
+            thumbnail: None,
+            duration: None,
+            uploader: None,
+            description: Some("HLS/m3u8 · N_m3u8DL-RE".into()),
+            webpage_url: Some(url),
+            is_playlist: false,
+            formats: Vec::new(),
+            playlist: None,
+            playlist_title: None,
+            playlist_count: None,
+        });
+    }
+
     let engine_override =
         resolve_engine_override(engine_path.as_deref(), settings.engine_path.as_deref());
     let engine = find_engine(engine_override.as_deref())?;

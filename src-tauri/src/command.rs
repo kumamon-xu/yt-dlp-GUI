@@ -149,6 +149,8 @@ pub fn build_preview_args(
         a.push(js.to_string());
     }
     push_network_auth(&mut a, cookies_file, cookies_browser, proxy);
+    // Generic HTML5/HLS extractors may request a manifest before setting Referer.
+    a.extend(["--referer".into(), url.into()]);
     a.push(url.to_string());
     a
 }
@@ -357,6 +359,7 @@ pub fn build_args(cfg: &TaskConfig) -> Vec<String> {
         cfg.cookies_browser.as_deref(),
         cfg.proxy.as_deref(),
     );
+    a.extend(["--referer".into(), cfg.url.clone()]);
 
     if cfg.embed_thumbnail {
         a.push("--embed-thumbnail".into());

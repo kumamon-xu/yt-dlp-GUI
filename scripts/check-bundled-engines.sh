@@ -4,12 +4,14 @@ set -euo pipefail
 ROOT="${1:-.}"
 NAME_YT="yt-dlp"
 NAME_FF="ffmpeg"
+NAME_RE="N_m3u8DL-RE"
 case "$(uname -s)" in
-  MINGW*|MSYS*|CYGWIN*) NAME_YT="yt-dlp.exe"; NAME_FF="ffmpeg.exe" ;;
+  MINGW*|MSYS*|CYGWIN*) NAME_YT="yt-dlp.exe"; NAME_FF="ffmpeg.exe"; NAME_RE="N_m3u8DL-RE.exe" ;;
 esac
 
 found_yt=0
 found_ff=0
+found_re=0
 while IFS= read -r -d "" f; do
   echo "found $f ($(wc -c < "$f") bytes)"
   if [[ ! -x "$f" && "$(uname -s)" != MINGW* ]]; then
@@ -25,18 +27,21 @@ while IFS= read -r -d "" f; do
   if [[ "$base" == yt-dlp* ]]; then
     found_yt=1
     "$f" --version >/dev/null
-  else
+  elif [[ "$base" == ffmpeg* ]]; then
     found_ff=1
     "$f" -version >/dev/null
+  else
+    found_re=1
+    "$f" --version >/dev/null
   fi
-done < <(find "$ROOT" -type f \( -name "$NAME_YT" -o -name "$NAME_FF" \) -path "*/code/*" -print0 2>/dev/null)
+done < <(find "$ROOT" -type f \( -name "$NAME_YT" -o -name "$NAME_FF" -o -name "$NAME_RE" \) -path "*/code/*" -print0 2>/dev/null)
 
-if [[ "$found_yt" -eq 0 || "$found_ff" -eq 0 ]]; then
-  echo "need both $NAME_YT and $NAME_FF under $ROOT/**/code/ (yt=$found_yt ff=$found_ff)" >&2
+if [[ "$found_yt" -eq 0 || "$found_ff" -eq 0 || "$found_re" -eq 0 ]]; then
+  echo "need $NAME_YT, $NAME_FF and $NAME_RE under $ROOT/**/code/" >&2
   exit 1
 fi
 
-for name in THIRD_PARTY_NOTICES.md FFmpeg-GPL-3.0.txt yt-dlp-Unlicense.txt; do
+for name in THIRD_PARTY_NOTICES.md FFmpeg-GPL-3.0.txt yt-dlp-Unlicense.txt N_m3u8DL-RE-MIT.txt; do
   legal=$(find "$ROOT" -type f -name "$name" -path "*/licenses/*" -print -quit 2>/dev/null)
   if [[ -z "$legal" || ! -s "$legal" ]]; then
     echo "bundled legal file missing: $name" >&2

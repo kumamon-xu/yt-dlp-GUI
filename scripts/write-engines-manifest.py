@@ -55,6 +55,8 @@ def lock_metadata(lock: dict, tool: str, key: str) -> dict:
 
 def latest_url(os_name: str, arch: str, tool: str) -> Optional[str]:
     os_name = os_name.lower()
+    if tool == "N_m3u8DL-RE":
+        return "https://github.com/nilaoda/N_m3u8DL-RE/releases/latest"
     if tool == "yt-dlp":
         if os_name.startswith("win"):
             return "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
@@ -72,6 +74,11 @@ def latest_url(os_name: str, arch: str, tool: str) -> Optional[str]:
 
 def latest_metadata(os_name: str, tool: str) -> dict:
     os_name = os_name.lower()
+    if tool == "N_m3u8DL-RE":
+        return {
+            "source_url": "https://github.com/nilaoda/N_m3u8DL-RE/releases/latest",
+            "license_notice_url": "https://github.com/nilaoda/N_m3u8DL-RE/blob/main/LICENSE",
+        }
     if tool == "yt-dlp":
         return {
             "source_url": "https://github.com/yt-dlp/yt-dlp/releases/latest",
@@ -100,7 +107,7 @@ def main():
     code = root / "code"
     yk, fk = yt_key(args.os, args.arch), ff_key(args.os, args.arch)
     engines = []
-    for n, tool, key in (("yt-dlp.exe", "yt-dlp", yk), ("yt-dlp", "yt-dlp", yk), ("ffmpeg.exe", "ffmpeg", fk), ("ffmpeg", "ffmpeg", fk)):
+    for n, tool, key in (("yt-dlp.exe", "yt-dlp", yk), ("yt-dlp", "yt-dlp", yk), ("ffmpeg.exe", "ffmpeg", fk), ("ffmpeg", "ffmpeg", fk), ("N_m3u8DL-RE.exe", "N_m3u8DL-RE", fk), ("N_m3u8DL-RE", "N_m3u8DL-RE", fk)):
         p = code / n
         if not (p.is_file() and p.stat().st_size > 0):
             continue

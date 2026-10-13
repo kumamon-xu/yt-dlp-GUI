@@ -48,6 +48,7 @@ function StatusChip({ label, status, checking }: { label: string; status: ToolSt
 export default function App() {
   const engine = useAppStore((s) => s.engine);
   const ffmpeg = useAppStore((s) => s.ffmpeg);
+  const m3u8dl = useAppStore((s) => s.m3u8dl);
   const jsRuntime = useAppStore((s) => s.jsRuntime);
   const checking = useAppStore((s) => s.checking);
   const refresh = useAppStore((s) => s.refresh);
@@ -74,9 +75,10 @@ export default function App() {
             <p className="text-[11px] leading-tight text-slate-500">{t("app.subtitle")}</p>
           </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center justify-end gap-2">
           <StatusChip label={t("chip.engine")} status={engine} checking={checking} />
           <StatusChip label={t("chip.ffmpeg")} status={ffmpeg} checking={checking} />
+          <StatusChip label="m3u8DL" status={m3u8dl} checking={checking} />
           <StatusChip label={t("chip.js")} status={jsRuntime} checking={checking} />
           <button onClick={() => void refresh()} title="refresh" className="rounded-md p-1.5 text-slate-400 hover:bg-slate-800">
             <RotateCw size={14} />

@@ -16,6 +16,8 @@ const emptySettings = (): GlobalSettings => ({
   proxy: null,
   enginePath: null,
   ffmpegPath: null,
+  m3u8dlPath: null,
+  useM3u8dl: true,
   mergeFormat: "mp4",
 });
 
@@ -104,6 +106,23 @@ export default function SettingsPage() {
               </button>
             </div>
           </label>
+          <label className="block text-[11px] text-slate-500">
+            {t("settings.m3u8dl")}
+            <div className="mt-1 flex gap-1">
+              <input className={field} value={draft.m3u8dlPath ?? ""} placeholder={t("settings.autoPath")}
+                onChange={(e) => patch({ m3u8dlPath: e.target.value || null })} />
+              <button className="rounded-md border border-slate-700 px-2 text-xs" onClick={async () => {
+                const f = await pickFile();
+                if (f) patch({ m3u8dlPath: f });
+              }}>…</button>
+            </div>
+          </label>
+          <label className="flex items-center gap-2 text-xs text-slate-300">
+            <input type="checkbox" checked={draft.useM3u8dl ?? true}
+              onChange={(e) => patch({ useM3u8dl: e.target.checked })} />
+            {t("settings.useM3u8dl")}
+          </label>
+          <p className="text-[11px] text-slate-500">{t("settings.m3u8dlHint")}</p>
           <label className="block text-[11px] text-slate-500">
             {t("opt.dir")}
             <div className="mt-1 flex gap-1">

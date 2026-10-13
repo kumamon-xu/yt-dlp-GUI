@@ -110,7 +110,7 @@ jobs:
             if [ -z "$existing" ]; then
               gh release create nightly --draft --prerelease --target "$GITHUB_SHA" \
                 --title "yt-dlp GUI nightly" \
-                --notes "Rolling main-branch build. Installers bundle yt-dlp and FFmpeg."
+                --notes "Rolling main-branch build. Installers bundle yt-dlp, FFmpeg and N_m3u8DL-RE."
             fi
             clear_release_assets
             gh release upload nightly publish/*

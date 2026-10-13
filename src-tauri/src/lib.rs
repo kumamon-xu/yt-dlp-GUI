@@ -9,6 +9,7 @@ mod config;
 mod fsutil;
 mod info;
 mod locate;
+mod m3u8;
 mod parser;
 mod redact;
 mod tasks;
@@ -79,6 +80,10 @@ pub(crate) fn find_engine(override_path: Option<&str>) -> Result<PathBuf, String
 
 pub(crate) fn find_ffmpeg(override_path: Option<&str>) -> Result<PathBuf, String> {
     locate::locate_tool("ffmpeg", override_path, &current_lookup()).map(|(p, _)| p)
+}
+
+pub(crate) fn find_m3u8dl(override_path: Option<&str>) -> Result<PathBuf, String> {
+    locate::locate_tool("N_m3u8DL-RE", override_path, &current_lookup()).map(|(p, _)| p)
 }
 
 pub(crate) fn js_runtime_arg() -> Option<String> {
@@ -344,6 +349,17 @@ async fn check_ffmpeg(state: tauri::State<'_, AppState>) -> Result<ToolStatus, S
 }
 
 #[tauri::command]
+async fn check_m3u8dl(state: tauri::State<'_, AppState>) -> Result<ToolStatus, String> {
+    let path = state
+        .settings
+        .lock()
+        .ok()
+        .and_then(|s| s.m3u8dl_path.clone());
+    let (p, source) = locate::locate_tool("N_m3u8DL-RE", path.as_deref(), &current_lookup())?;
+    Ok(probe(&p, &["--version"], source).await)
+}
+
+#[tauri::command]
 async fn check_js_runtime() -> ToolStatus {
     match resolve_supported_js_runtime() {
         Ok(r) => ToolStatus {
@@ -385,7 +401,6 @@ fn build_command(
     task: command::NewTask,
 ) -> Result<String, String> {
     let (eng, ff) = overrides(&state);
-    let engine = find_engine(eng.as_deref())?;
     let settings = state
         .settings
         .lock()
@@ -393,9 +408,34 @@ fn build_command(
         .map(|s| s.clone())
         .unwrap_or_default();
     let mut cfg = command::resolve_effective_config(task, &settings);
+    cfg.out_dir = command::resolve_out_dir(&cfg, None);
     let ff = resolve_ffmpeg(ff.as_deref(), command::needs_ffmpeg(&cfg))?;
     cfg.ffmpeg_location = ff.map(|p| p.to_string_lossy().into());
     cfg.js_runtime = js_runtime_arg();
+    if settings.use_m3u8dl && m3u8::eligible(&cfg) {
+        if m3u8::direct_auto(&cfg) {
+            let engine = find_m3u8dl(settings.m3u8dl_path.as_deref())?;
+            let source = m3u8::direct_source(&cfg.url);
+            let base = m3u8::output_base(&cfg, &source, "task");
+            let args = m3u8::build_args(
+                &cfg,
+                &source,
+                &base,
+                &Path::new(&cfg.out_dir).join(".m3u8dl/task"),
+            )?;
+            return Ok(crate::redact::format_command_preview(
+                &engine.to_string_lossy(),
+                &args,
+            ));
+        }
+        let engine = find_engine(eng.as_deref())?;
+        let args = m3u8::resolver_args(&cfg, None);
+        return Ok(format!(
+            "{} → N_m3u8DL-RE (HLS) / yt-dlp",
+            crate::redact::format_command_preview(&engine.to_string_lossy(), &args)
+        ));
+    }
+    let engine = find_engine(eng.as_deref())?;
     let args = command::build_args(&cfg);
     Ok(crate::redact::format_command_preview(
         &engine.to_string_lossy(),
@@ -561,6 +601,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             check_engine,
             check_ffmpeg,
+            check_m3u8dl,
             check_js_runtime,
             engine_path,
             ffmpeg_path,

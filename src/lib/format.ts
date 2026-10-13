@@ -65,8 +65,8 @@ export function formatOptions(formats: FormatInfo[]): FormatOption[] {
 }
 
 /** 仅视频补 +ba，避免无声文件 */
-export function customFormatFromSelection(o: FormatOption | null): { preset: string; customFormat?: string } {
-  if (!o) return { preset: "best" };
+export function customFormatFromSelection(o: FormatOption | null): { preset?: string; customFormat?: string } {
+  if (!o) return {};
   if (o.vcodec && !o.acodec) {
     return { preset: "custom", customFormat: `${o.formatId}+ba/${o.formatId}/b` };
   }

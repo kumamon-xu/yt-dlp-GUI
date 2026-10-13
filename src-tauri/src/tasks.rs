@@ -15,7 +15,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::process::Child;
 
 #[cfg(test)]
@@ -86,6 +86,10 @@ pub struct TaskPayload {
     pub total: u64,
     pub speed: f64,
     pub eta: f64,
+    #[serde(default)]
+    pub progress: Option<f64>,
+    #[serde(default)]
+    pub download_engine: Option<String>,
     pub file_path: Option<String>,
     #[serde(default)]
     pub output_files: Vec<String>,
@@ -510,6 +514,7 @@ fn settings_snapshot(app: &AppHandle) -> crate::GlobalSettings {
 }
 
 /// Spawn a download process. Returns the generation number.
+#[cfg(test)]
 pub fn spawn_download_with(
     inner: Arc<TaskInner>,
     engine: &Path,
@@ -558,9 +563,25 @@ pub fn spawn_download_with(
     });
     cfg.out_dir = crate::command::resolve_out_dir(&cfg, download_dir);
     let args = build_args(&cfg);
-    *inner.args.lock().unwrap() = args.clone();
-
     crate::fsutil::ensure_writable_dir(Path::new(&cfg.out_dir))?;
+    spawn_process(inner, engine, args, app, None, None)
+}
+
+#[derive(Clone)]
+struct HlsRun {
+    output_base: std::path::PathBuf,
+    format: String,
+}
+
+fn spawn_process(
+    inner: Arc<TaskInner>,
+    engine: &Path,
+    args: Vec<String>,
+    app: Option<AppHandle>,
+    expected_generation: Option<u64>,
+    hls: Option<HlsRun>,
+) -> Result<u64, String> {
+    *inner.args.lock().unwrap() = args.clone();
 
     {
         let p = inner.payload.lock().unwrap();
@@ -573,7 +594,14 @@ pub fn spawn_download_with(
 
     let gen = {
         let _run = inner.run_mu.lock().unwrap();
-        let gen = inner.run_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let gen = if let Some(gen) = expected_generation {
+            if inner.run_generation.load(Ordering::SeqCst) != gen {
+                return Err("任务已取消或暂停".into());
+            }
+            gen
+        } else {
+            inner.run_generation.fetch_add(1, Ordering::SeqCst) + 1
+        };
         let old = inner.child.lock().unwrap().take();
         if let Some(mut old) = old {
             let _ = old.start_kill();
@@ -591,6 +619,7 @@ pub fn spawn_download_with(
 
     let mut cmd = no_window_cmd(engine);
     cmd.args(&args)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -618,7 +647,8 @@ pub fn spawn_download_with(
                 transition(&mut p, TaskStatus::Downloading);
                 p.error = None;
                 p.error_code = None;
-                p.request.resume = Some(cfg.resume);
+                p.download_engine = Some(if hls.is_some() { "m3u8dl" } else { "ytDlp" }.into());
+                p.progress = None;
                 None
             }
         }
@@ -640,8 +670,21 @@ pub fn spawn_download_with(
     let i1 = Arc::clone(&inner);
     let i2 = Arc::clone(&inner);
     let i3 = Arc::clone(&inner);
-    tokio::spawn(async move { read_stdout(stdout, app1, i1, gen).await });
-    tokio::spawn(async move { read_stderr(stderr, app2, i2, gen).await });
+    let is_hls = hls.is_some();
+    let stdout_reader = tokio::spawn(async move {
+        if is_hls {
+            read_hls_output(stdout, app1, i1, gen).await;
+        } else {
+            read_stdout(stdout, app1, i1, gen).await;
+        }
+    });
+    let stderr_reader = tokio::spawn(async move {
+        if is_hls {
+            read_hls_output(stderr, app2, i2, gen).await;
+        } else {
+            read_stderr(stderr, app2, i2, gen).await;
+        }
+    });
     tokio::spawn(async move {
         let mut child = loop {
             if i3.run_generation.load(Ordering::SeqCst) != gen {
@@ -659,7 +702,30 @@ pub fn spawn_download_with(
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         };
         let st = child.wait().await;
-        let success = st.as_ref().map(|s| s.success()).unwrap_or(false);
+        let _ = tokio::join!(stdout_reader, stderr_reader);
+        let mut success = st.as_ref().map(|s| s.success()).unwrap_or(false);
+        if i3.run_generation.load(Ordering::SeqCst) == gen {
+            if let Some(run) = hls {
+                // Append the container: set_extension would truncate a title containing dots.
+                let output = std::path::PathBuf::from(format!(
+                    "{}.{}",
+                    run.output_base.display(),
+                    run.format
+                ));
+                if success && output.is_file() {
+                    let mut p = i3.payload.lock().unwrap();
+                    p.file_path = Some(output.to_string_lossy().into());
+                    p.output_files = vec![output.to_string_lossy().into()];
+                    p.progress = Some(100.);
+                } else if success {
+                    success = false;
+                    i3.stderr_tail
+                        .lock()
+                        .unwrap()
+                        .push_back("N_m3u8DL-RE 未生成预期的输出文件，请检查日志".into());
+                }
+            }
+        }
         let owned = apply_child_exit(&i3, gen, success);
         if owned {
             if let Some(app) = &app3 {
@@ -676,21 +742,318 @@ pub fn spawn_download_with(
     Ok(gen)
 }
 
-fn spawn_download(app: AppHandle, inner: Arc<TaskInner>) -> Result<u64, String> {
+async fn spawn_download(app: AppHandle, inner: Arc<TaskInner>, gen: u64) -> Result<u64, String> {
     let settings = settings_snapshot(&app);
     let mut request = inner.payload.lock().unwrap().request.clone();
     apply_settings(&mut request, &settings);
     inner.payload.lock().unwrap().request = request.clone();
-    let cfg_preview = {
+    let mut cfg_preview = {
         let mut c = request.to_config();
         if let Some(k) = request.kind {
             apply_kind_constraints(&mut c, k);
         }
         c
     };
-    let engine = find_engine(settings.engine_path.as_deref())?;
     let ffmpeg = resolve_ffmpeg(settings.ffmpeg_path.as_deref(), needs_ffmpeg(&cfg_preview))?;
-    spawn_download_with(inner, &engine, ffmpeg.as_deref(), Some(app))
+    cfg_preview.ffmpeg_location = ffmpeg.as_ref().map(|p| p.to_string_lossy().into());
+    cfg_preview.js_runtime = js_runtime_arg();
+    cfg_preview.out_dir = crate::command::resolve_out_dir(
+        &cfg_preview,
+        app.path()
+            .download_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into()),
+    );
+    crate::fsutil::ensure_writable_dir(Path::new(&cfg_preview.out_dir))?;
+    let route_hls = settings.use_m3u8dl && crate::m3u8::eligible(&cfg_preview);
+    let source = if route_hls {
+        if crate::m3u8::direct_auto(&cfg_preview)
+            && (cfg_preview
+                .cookies_file
+                .as_ref()
+                .is_some_and(|s| !s.is_empty())
+                || cfg_preview
+                    .cookies_browser
+                    .as_ref()
+                    .is_none_or(|s| s.is_empty()))
+        {
+            Some(crate::m3u8::direct_source(&request.url))
+        } else {
+            let engine = find_engine(settings.engine_path.as_deref())?;
+            match resolve_task_source(&app, &inner, gen, &engine, &cfg_preview).await {
+                Ok(source) => source,
+                Err(e) if still_starting(&inner, gen) => {
+                    let id = inner.payload.lock().unwrap().id.clone();
+                    let _ = app.emit("task_log", serde_json::json!({"id":id,"line":format!("HLS 预解析未成功，交给 yt-dlp 下载：{e}")}));
+                    None
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    } else {
+        None
+    };
+    if !still_starting(&inner, gen) {
+        return Err("任务已取消或暂停".into());
+    }
+    if let Some(mut source) = source {
+        let engine = crate::find_m3u8dl(settings.m3u8dl_path.as_deref())?;
+        if let Some(file) = cfg_preview.cookies_file.as_ref().filter(|s| !s.is_empty()) {
+            add_cookie_header(&mut source, file)?;
+        }
+        let id = inner.payload.lock().unwrap().id.clone();
+        let base = crate::m3u8::output_base(&cfg_preview, &source, &id);
+        let format = if cfg_preview.merge_format.is_empty() {
+            "mp4".into()
+        } else {
+            cfg_preview.merge_format.clone()
+        };
+        // Isolate names between simultaneous jobs and retries; never overwrite an existing download.
+        let base = unique_hls_base(base, &format, &id);
+        if let Some(parent) = base.parent() {
+            crate::fsutil::ensure_writable_dir(parent)?;
+        }
+        let safe_id: String = id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .take(64)
+            .collect();
+        let tmp = Path::new(&cfg_preview.out_dir)
+            .join(".m3u8dl")
+            .join(safe_id);
+        let args = crate::m3u8::build_args(&cfg_preview, &source, &base, &tmp)?;
+        {
+            let mut p = inner.payload.lock().unwrap();
+            p.title = Some(source.title);
+        }
+        let _ = app.emit("task_log", serde_json::json!({"id":id,"line":"已识别 HLS，使用 N_m3u8DL-RE 下载。继续任务会重新解析并重新下载分片。"}));
+        spawn_process(
+            inner,
+            &engine,
+            args,
+            Some(app),
+            Some(gen),
+            Some(HlsRun {
+                output_base: base,
+                format,
+            }),
+        )
+    } else {
+        let engine = find_engine(settings.engine_path.as_deref())?;
+        let args = build_args(&cfg_preview);
+        spawn_process(inner, &engine, args, Some(app), Some(gen), None)
+    }
+}
+
+fn still_starting(inner: &TaskInner, gen: u64) -> bool {
+    inner.run_generation.load(Ordering::SeqCst) == gen
+        && !inner.canceled.load(Ordering::SeqCst)
+        && inner.payload.lock().unwrap().status == TaskStatus::Starting
+}
+
+fn unique_hls_base(base: std::path::PathBuf, format: &str, id: &str) -> std::path::PathBuf {
+    // The task id also avoids races between two jobs with the same resolved title.
+    let name = crate::m3u8::safe_name(&base.file_name().unwrap_or_default().to_string_lossy());
+    let id: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(36)
+        .collect();
+    let candidate = base.with_file_name(format!("{name} [{id}]"));
+    if !Path::new(&format!("{}.{format}", candidate.display())).exists() {
+        return candidate;
+    }
+    for n in 1.. {
+        let next = base.with_file_name(format!("{name} [{id}] ({n})"));
+        if !Path::new(&format!("{}.{format}", next.display())).exists() {
+            return next;
+        }
+    }
+    unreachable!()
+}
+
+fn add_cookie_header(source: &mut crate::m3u8::HlsSource, file: &str) -> Result<(), String> {
+    let text = std::fs::read_to_string(file).map_err(|e| format!("无法读取 Cookies 文件：{e}"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let cookies = crate::m3u8::cookie_header(&text, &source.url, now);
+    if !cookies.is_empty() {
+        source
+            .headers
+            .retain(|k, _| !k.eq_ignore_ascii_case("cookie"));
+        source.headers.insert("Cookie".into(), cookies);
+    }
+    Ok(())
+}
+
+struct ExportedCookies(std::path::PathBuf);
+impl Drop for ExportedCookies {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+async fn resolve_task_source(
+    app: &AppHandle,
+    inner: &TaskInner,
+    gen: u64,
+    engine: &Path,
+    cfg: &crate::command::TaskConfig,
+) -> Result<Option<crate::m3u8::HlsSource>, String> {
+    let exported = if cfg.cookies_file.as_ref().is_none_or(|s| s.is_empty())
+        && cfg.cookies_browser.as_ref().is_some_and(|s| !s.is_empty())
+    {
+        let id = inner.payload.lock().unwrap().id.clone();
+        let safe_id: String = id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .take(64)
+            .collect();
+        Some(ExportedCookies(
+            crate::config::config_dir(app)?.join(format!("cookies-{safe_id}-{gen}.tmp")),
+        ))
+    } else {
+        None
+    };
+    let args = crate::m3u8::resolver_args(cfg, exported.as_ref().map(|f| f.0.as_path()));
+    let mut child = no_window_cmd(engine)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let pid = child.id().unwrap_or(0);
+    {
+        let _run = inner.run_mu.lock().unwrap();
+        if !still_starting(inner, gen) {
+            let _ = child.start_kill();
+            return Err("任务已取消或暂停".into());
+        }
+        inner.pid.store(pid, Ordering::SeqCst);
+    }
+    let output =
+        tokio::time::timeout(std::time::Duration::from_secs(60), child.wait_with_output()).await;
+    {
+        let _run = inner.run_mu.lock().unwrap();
+        if inner.run_generation.load(Ordering::SeqCst) == gen {
+            inner.pid.store(0, Ordering::SeqCst);
+        }
+    }
+    if !still_starting(inner, gen) {
+        return Err("任务已取消或暂停".into());
+    }
+    let out = match output {
+        Ok(result) => result.map_err(|e| e.to_string())?,
+        Err(_) => {
+            kill_process_tree_grace(pid, std::time::Duration::ZERO);
+            return Err("视频解析超时（60s）".into());
+        }
+    };
+    if !out.status.success() && crate::m3u8::direct_auto(cfg) {
+        if let Some(file) = exported.as_ref().filter(|f| f.0.is_file()) {
+            let mut source = crate::m3u8::direct_source(&cfg.url);
+            add_cookie_header(&mut source, &file.0.to_string_lossy())?;
+            return Ok(Some(source));
+        }
+    }
+    if !out.status.success() {
+        return Err(crate::parser::friendly_error(&String::from_utf8_lossy(
+            &out.stderr,
+        )));
+    }
+    if out.stdout.len() > 8 * 1024 * 1024 {
+        return Err("视频解析结果过大".into());
+    }
+    let value = crate::m3u8::parse_resolver_output(&out.stdout)?;
+    let mut source = crate::m3u8::source_from_info(&value)
+        .or_else(|| crate::m3u8::direct_auto(cfg).then(|| crate::m3u8::direct_source(&cfg.url)));
+    if let (Some(source), Some(file)) = (&mut source, &exported) {
+        add_cookie_header(source, &file.0.to_string_lossy())?;
+    }
+    Ok(source)
+}
+
+async fn read_hls_output<R: AsyncRead + Unpin>(
+    mut reader: R,
+    app: Option<AppHandle>,
+    inner: Arc<TaskInner>,
+    gen: u64,
+) {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while let Ok(count) = reader.read(&mut chunk).await {
+        if count == 0 {
+            break;
+        }
+        if inner.run_generation.load(Ordering::SeqCst) != gen {
+            return;
+        }
+        for &byte in &chunk[..count] {
+            if byte == b'\r' || byte == b'\n' || buffer.len() >= 32768 {
+                hls_line(&String::from_utf8_lossy(&buffer), &app, &inner, gen);
+                buffer.clear();
+            } else {
+                buffer.push(byte);
+            }
+        }
+    }
+    hls_line(&String::from_utf8_lossy(&buffer), &app, &inner, gen);
+}
+
+fn hls_line(raw: &str, app: &Option<AppHandle>, inner: &TaskInner, gen: u64) {
+    let line = crate::m3u8::clean_console(raw);
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    // Never retain authentication headers in the error tail or persisted errors.
+    if line.to_ascii_lowercase().contains("cookie:")
+        || line.to_ascii_lowercase().contains("authorization:")
+    {
+        return;
+    }
+    let _run = inner.run_mu.lock().unwrap();
+    if inner.run_generation.load(Ordering::SeqCst) != gen {
+        return;
+    }
+    let mut p = inner.payload.lock().unwrap();
+    if !p.status.is_running_download() {
+        return;
+    }
+    if let Some(percent) = crate::m3u8::progress(line) {
+        p.progress = Some(percent);
+    }
+    if line.contains("Merging") || line.contains("Muxing") {
+        p.status = TaskStatus::Postprocess;
+    }
+    let id = p.id.clone();
+    let has_progress = p.progress.is_some();
+    drop(p);
+    // RE writes failures to stdout too; keep both streams for error classification.
+    let mut tail = inner.stderr_tail.lock().unwrap();
+    tail.push_back(crate::redact::redact_userinfo(line));
+    if tail.len() > 20 {
+        tail.pop_front();
+    }
+    drop(tail);
+    if let Some(app) = app {
+        if has_progress {
+            emit_payload(app, inner);
+        }
+        // Cookie headers must never appear in the UI log.
+        if !line.to_ascii_lowercase().contains("cookie:")
+            && !line.to_ascii_lowercase().contains("authorization:")
+        {
+            let _ = app.emit(
+                "task_log",
+                serde_json::json!({"id":id,"line":crate::redact::redact_userinfo(line)}),
+            );
+        }
+    }
 }
 
 fn max_concurrent(app: &AppHandle) -> u32 {
@@ -710,18 +1073,30 @@ fn pump_queue(app: AppHandle) {
             claim_next(mgr.inner(), cap)
         };
         let Some(inner) = next else { return };
-        if let Err(e) = spawn_download(app.clone(), Arc::clone(&inner)) {
-            {
-                let mut p = inner.payload.lock().unwrap();
-                if p.status == TaskStatus::Starting {
-                    p.status = TaskStatus::Failed;
-                    p.error = Some(e);
-                    p.error_code = Some("PROCESS_FAILED".into());
+        let gen = {
+            let _run = inner.run_mu.lock().unwrap();
+            inner.run_generation.fetch_add(1, Ordering::SeqCst) + 1
+        };
+        emit_payload(&app, &inner);
+        let app = app.clone();
+        tokio::spawn(async move {
+            if let Err(e) = spawn_download(app.clone(), Arc::clone(&inner), gen).await {
+                {
+                    let _run = inner.run_mu.lock().unwrap();
+                    let mut p = inner.payload.lock().unwrap();
+                    if inner.run_generation.load(Ordering::SeqCst) == gen
+                        && p.status == TaskStatus::Starting
+                    {
+                        p.status = TaskStatus::Failed;
+                        p.error = Some(e);
+                        p.error_code = Some("PROCESS_FAILED".into());
+                    }
                 }
+                emit_payload(&app, &inner);
+                persist_ok(&app);
+                pump_queue(app);
             }
-            emit_payload(&app, &inner);
-            persist_ok(&app);
-        }
+        });
     }
 }
 
@@ -761,6 +1136,8 @@ fn empty_payload(id: String, task: NewTask) -> TaskPayload {
         total: 0,
         speed: 0.0,
         eta: 0.0,
+        progress: None,
+        download_engine: None,
         file_path: None,
         output_files: Vec::new(),
         error: None,
@@ -897,14 +1274,19 @@ pub async fn cancel_task(
         .get(&id)
         .cloned()
         .ok_or_else(|| "任务不存在".to_string())?;
-    inner.canceled.store(true, Ordering::SeqCst);
     {
+        let _run = inner.run_mu.lock().unwrap();
+        inner.run_generation.fetch_add(1, Ordering::SeqCst);
+        inner.canceled.store(true, Ordering::SeqCst);
         let mut p = inner.payload.lock().unwrap();
         transition(&mut p, TaskStatus::Canceled);
         p.speed = 0.0;
+        drop(p);
+        kill_inner_grace(&inner, std::time::Duration::from_millis(400));
+        inner.pid.store(0, Ordering::SeqCst);
+        inner.child.lock().unwrap().take();
     }
     emit_payload(&app, &inner);
-    kill_inner_grace(&inner, std::time::Duration::from_millis(400));
     persist_ok(&app);
     pump_queue(app);
     Ok(())
@@ -924,6 +1306,7 @@ pub async fn pause_task(
         .cloned()
         .ok_or_else(|| "任务不存在".to_string())?;
     {
+        let _run = inner.run_mu.lock().unwrap();
         let mut p = inner.payload.lock().unwrap();
         if p.status == TaskStatus::Queued || p.status == TaskStatus::Starting {
             transition(&mut p, TaskStatus::Paused);
@@ -932,9 +1315,15 @@ pub async fn pause_task(
             p.speed = 0.0;
             p.request.resume = Some(true);
         }
+        if p.status == TaskStatus::Paused {
+            inner.run_generation.fetch_add(1, Ordering::SeqCst);
+            drop(p);
+            kill_inner_grace(&inner, std::time::Duration::from_millis(1500));
+            inner.pid.store(0, Ordering::SeqCst);
+            inner.child.lock().unwrap().take();
+        }
     }
     emit_payload(&app, &inner);
-    kill_inner_grace(&inner, std::time::Duration::from_millis(1500));
     persist_ok(&app);
     pump_queue(app);
     Ok(())
@@ -1858,5 +2247,275 @@ fn main() {{
             claim_next(&mgr, 2).is_none(),
             "tombstone must block claim even if the row is still queued"
         );
+    }
+
+    #[tokio::test]
+    async fn hls_reader_handles_carriage_returns_and_hides_auth_headers() {
+        let inner = make_inner("hls-progress", "https://test/index.m3u8");
+        inner.payload.lock().unwrap().status = TaskStatus::Downloading;
+        inner.run_generation.store(1, Ordering::SeqCst);
+        let data: &[u8] = b"\x1b[32mVid 25.0%\x1b[0m\rVid 75.0%\rCookie: sid=secret\nAuthorization: Bearer secret\rMuxing\n";
+        read_hls_output(data, None, Arc::clone(&inner), 1).await;
+        let p = inner.payload.lock().unwrap();
+        assert_eq!(p.progress, Some(75.));
+        assert_eq!(p.status, TaskStatus::Postprocess);
+        drop(p);
+        assert!(!inner
+            .stderr_tail
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.contains("secret")));
+        inner.run_generation.store(2, Ordering::SeqCst);
+        hls_line("Vid 90%", &None, &inner, 1);
+        assert_eq!(inner.payload.lock().unwrap().progress, Some(75.));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires native engines and local fixtures; run python scripts/smoke-hls.py"]
+    async fn real_hls_download_smoke() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let engine = root.join("code").join(crate::locate::bin_name("yt-dlp"));
+        let re = root
+            .join("code")
+            .join(crate::locate::bin_name("N_m3u8DL-RE"));
+        let ffmpeg = root.join("code").join(crate::locate::bin_name("ffmpeg"));
+        let host = std::env::var("TEST_HLS_URL").expect("run scripts/smoke-hls.py");
+        let cookies = std::env::var("TEST_HLS_COOKIES").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "real-hls-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cases = [
+            (
+                "master.m3u8?token=demo",
+                crate::command::Preset::Limit720,
+                true,
+                true,
+            ),
+            ("watch.html", crate::command::Preset::Best, true, true),
+            (
+                "encrypted.m3u8",
+                crate::command::Preset::Limit1080,
+                true,
+                true,
+            ),
+            (
+                "watch.html",
+                crate::command::Preset::Custom("hls-audio-English".into()),
+                false,
+                true,
+            ),
+            (
+                "watch.html",
+                crate::command::Preset::Custom("hls-200".into()),
+                true,
+                false,
+            ),
+        ];
+        for (index, (suffix, preset, expect_video, expect_audio)) in cases.into_iter().enumerate() {
+            let url = format!("{host}/{suffix}");
+            let cfg = crate::command::TaskConfig {
+                url: url.clone(),
+                no_playlist: true,
+                out_dir: dir.to_string_lossy().into(),
+                out_template: format!("Fixture.with.dots-{index}.%(ext)s"),
+                ffmpeg_location: Some(ffmpeg.to_string_lossy().into()),
+                cookies_file: Some(cookies.clone()),
+                merge_format: "mp4".into(),
+                preset,
+                ..Default::default()
+            };
+            let mut source = if crate::m3u8::direct_auto(&cfg) {
+                let mut s = crate::m3u8::direct_source(&url);
+                s.headers
+                    .insert("Referer".into(), format!("{host}/watch.html"));
+                Some(s)
+            } else {
+                let out = no_window_cmd(&engine)
+                    .args(crate::m3u8::resolver_args(&cfg, None))
+                    .output()
+                    .await
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let value = crate::m3u8::parse_resolver_output(&out.stdout).unwrap();
+                assert!(
+                    value["_filename"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("Fixture.with.dots")),
+                    "expanded filename: {}",
+                    value["_filename"]
+                );
+                let selected = crate::m3u8::source_from_info(&value);
+                if index == 1 {
+                    assert!(
+                        selected.is_none(),
+                        "multi-track selection must stay on yt-dlp"
+                    );
+                }
+                if index == 3 {
+                    assert!(selected.as_ref().unwrap().url.ends_with("/audio.m3u8"));
+                }
+                if index == 4 {
+                    assert!(selected.as_ref().unwrap().url.ends_with("/video.m3u8"));
+                }
+                selected
+            };
+            let base = dir.join(format!("Fixture.with.dots-{index}"));
+            let is_hls = source.is_some();
+            let args = if let Some(source) = source.as_mut() {
+                add_cookie_header(source, &cookies).unwrap();
+                crate::m3u8::build_args(&cfg, source, &base, &dir.join(format!("tmp-{index}")))
+                    .unwrap()
+            } else {
+                build_args(&cfg)
+            };
+            let inner = make_inner(&format!("real-{index}"), &url);
+            inner.payload.lock().unwrap().status = TaskStatus::Starting;
+            inner.run_generation.store(1, Ordering::SeqCst);
+            spawn_process(
+                Arc::clone(&inner),
+                if is_hls { &re } else { &engine },
+                args,
+                None,
+                Some(1),
+                is_hls.then_some(HlsRun {
+                    output_base: base.clone(),
+                    format: "mp4".into(),
+                }),
+            )
+            .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while inner.payload.lock().unwrap().status.is_live() {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("HLS process completes");
+            let p = inner.payload.lock().unwrap().clone();
+            let tail = inner
+                .stderr_tail
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(p.status, TaskStatus::Done, "{tail}");
+            assert_eq!(
+                p.download_engine.as_deref(),
+                Some(if is_hls { "m3u8dl" } else { "ytDlp" })
+            );
+            if is_hls {
+                assert_eq!(p.progress, Some(100.));
+            }
+            let output = format!("{}.mp4", base.display());
+            assert_eq!(p.file_path.as_deref(), Some(output.as_str()));
+            let verify = no_window_cmd(&ffmpeg)
+                .args(["-hide_banner", "-i", &output, "-f", "null", "-"])
+                .output()
+                .await
+                .unwrap();
+            let log = String::from_utf8_lossy(&verify.stderr);
+            assert!(verify.status.success(), "{log}");
+            assert!(
+                log.contains("Video:") == expect_video && log.contains("Audio:") == expect_audio,
+                "selected track types preserved: {log}"
+            );
+            if index == 4 {
+                assert!(
+                    log.contains("Video: h264") && log.contains("10 fps"),
+                    "selected codec/fps preserved: {log}"
+                );
+            }
+            eprintln!("Verified {suffix} ({:?}): video={expect_video}, audio={expect_audio}, engine={}, valid MP4", cfg.preset, p.download_engine.unwrap());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires native engines and local fixtures; run python scripts/smoke-hls.py"]
+    async fn real_hls_rate_smoke() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let host = std::env::var("TEST_HLS_URL").expect("run scripts/smoke-hls.py");
+        let cookies = std::env::var("TEST_HLS_COOKIES").unwrap();
+        let payload = std::env::var("TEST_HLS_RATE_BYTES")
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "real-hls-rate-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = crate::command::TaskConfig {
+            limit_rate: Some("1M".into()),
+            concurrent_fragments: 1,
+            ffmpeg_location: Some(
+                root.join("code")
+                    .join(crate::locate::bin_name("ffmpeg"))
+                    .to_string_lossy()
+                    .into(),
+            ),
+            ..Default::default()
+        };
+        let mut source = crate::m3u8::direct_source(&format!("{host}/rate.m3u8"));
+        source
+            .headers
+            .insert("Referer".into(), format!("{host}/watch.html"));
+        add_cookie_header(&mut source, &cookies).unwrap();
+        let mut args =
+            crate::m3u8::build_args(&cfg, &source, &dir.join("rate"), &dir.join("tmp")).unwrap();
+        let i = args.iter().position(|s| s == "--mux-after-done").unwrap();
+        args.drain(i..i + 2);
+        args.push("--skip-merge".into());
+        let start = std::time::Instant::now();
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            no_window_cmd(
+                &root
+                    .join("code")
+                    .join(crate::locate::bin_name("N_m3u8DL-RE")),
+            )
+            .args(&args)
+            .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let elapsed = start.elapsed().as_secs_f64();
+        assert!(
+            out.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // Allow probing/buffering variation; the former 8.192x rate completes far below this floor.
+        assert!(
+            elapsed >= payload / (1024. * 1024.) * 0.6,
+            "1 MiB/s limit was exceeded: {payload} bytes in {elapsed}s"
+        );
+        eprintln!(
+            "Verified pinned RE 1M rate: {:.2} MiB in {elapsed:.2}s",
+            payload / (1024. * 1024.)
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

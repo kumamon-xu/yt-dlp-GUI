@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Download yt-dlp + ffmpeg into code/.
+# Download yt-dlp + ffmpeg + N_m3u8DL-RE into code/.
 #   --lock   use engines.lock.json (Stable)
 #   --latest ignore lock (Nightly)
 #   --arch auto|x64|arm64
@@ -90,6 +90,9 @@ verify_license_file() {
 
 YTDLP="$CODE/yt-dlp"
 FFMPEG="$CODE/ffmpeg"
+m3u8_args=("$ROOT/scripts/fetch-m3u8dl.py" --os "$OS" --arch "$ARCH" --mode "$MODE")
+[[ "$FORCE" == 1 ]] && m3u8_args+=(--force)
+python3 "${m3u8_args[@]}"
 
 if [[ "$MODE" == lock ]]; then
   verify_license_file yt-dlp

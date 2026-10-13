@@ -16,6 +16,9 @@ describe("formatOptions", () => {
 });
 
 describe("customFormatFromSelection", () => {
+  it("does not override the session preset when no stream was selected", () => {
+    expect(customFormatFromSelection(null)).toEqual({});
+  });
   it("adds +ba for video-only", () => {
     const o: FormatOption = { formatId: "137", label: "1080p", sub: [], vcodec: "avc1", acodec: null, resolution: "1920x1080", height: 1080 };
     expect(customFormatFromSelection(o)).toEqual({ preset: "custom", customFormat: "137+ba/137/b" });

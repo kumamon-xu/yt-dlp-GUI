@@ -14,10 +14,10 @@ function TaskRow({ id }: { id: string }) {
   if (!task) return null;
 
   const stKey = `status.${task.status}`;
-  const pct = task.total > 0 ? Math.min(100, (task.downloaded / task.total) * 100) : 0;
+  const pct = task.progress ?? (task.total > 0 ? Math.min(100, (task.downloaded / task.total) * 100) : 0);
   const selectTask = useAppStore((s) => s.selectTask);
   const running = task.status === "downloading" || task.status === "postprocess" || task.status === "starting";
-  const indeterminate = running && task.total <= 0;
+  const indeterminate = running && task.total <= 0 && task.progress == null;
   const color =
     task.status === "failed" ? "text-red-400" : task.status === "done" ? "text-emerald-300" : "text-sky-300";
 
@@ -30,9 +30,10 @@ function TaskRow({ id }: { id: string }) {
           </p>
           <p className="mt-0.5 flex items-center gap-2 text-xs text-zinc-500">
             <span className={color}>{t(stKey)}</span>
+            {task.downloadEngine === "m3u8dl" && <span className="text-amber-300">N_m3u8DL-RE</span>}
             {running && (
               <>
-                <span>{fmtSpeed(task.speed)}</span>
+                {task.progress != null ? <span>{task.progress.toFixed(1)}%</span> : <span>{fmtSpeed(task.speed)}</span>}
                 {task.eta > 0 && <span>ETA {fmtEta(task.eta)}</span>}
                 {task.total > 0 && (
                   <span>

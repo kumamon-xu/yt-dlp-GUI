@@ -2,11 +2,13 @@ import { create } from "zustand";
 import { listen } from "@tauri-apps/api/event";
 import { translate, type Lang } from "./i18n";
 import { DEFAULT_PRESET } from "./presets";
+import { customFormatFromSelection, formatOptions } from "./lib/format";
 import {
   buildCommand,
   cancelTask,
   checkEngine,
   checkFfmpeg,
+  checkM3u8dl,
   checkJsRuntime,
   getInfo,
   listTasks,
@@ -72,6 +74,7 @@ interface AppState {
 
   engine: ToolStatus | null;
   ffmpeg: ToolStatus | null;
+  m3u8dl: ToolStatus | null;
   jsRuntime: ToolStatus | null;
   checking: boolean;
   refresh: () => Promise<void>;
@@ -106,12 +109,13 @@ interface AppState {
   commandPreview: string;
   refreshCommand: () => Promise<void>;
   loadAllSettings: () => Promise<void>;
-  persistSettings: (s: GlobalSettings) => Promise<void>;
+  persistSettings: (s: GlobalSettings, source?: "settings" | "options") => Promise<void>;
 
   settingsOpen: boolean;
   setSettingsOpen: (v: boolean) => void;
 
   buildTaskFromOptions: (url: string, extra?: Partial<NewTask>) => NewTask;
+  buildPreviewTask: () => NewTask;
 }
 
 let previewToken = 0;
@@ -160,19 +164,22 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   engine: null,
   ffmpeg: null,
+  m3u8dl: null,
   jsRuntime: null,
   checking: false,
   refresh: async () => {
     set({ checking: true });
-    const [engine, ffmpeg, jsRuntime] = await Promise.allSettled([
+    const [engine, ffmpeg, jsRuntime, m3u8dl] = await Promise.allSettled([
       checkEngine(),
       checkFfmpeg(),
       checkJsRuntime(),
+      checkM3u8dl(),
     ]);
     set({
       checking: false,
       engine: engine.status === "fulfilled" ? engine.value : toolError(engine.reason),
       ffmpeg: ffmpeg.status === "fulfilled" ? ffmpeg.value : toolError(ffmpeg.reason),
+      m3u8dl: m3u8dl.status === "fulfilled" ? m3u8dl.value : toolError(m3u8dl.reason),
       jsRuntime: jsRuntime.status === "fulfilled" ? jsRuntime.value : toolError(jsRuntime.reason),
     });
   },
@@ -289,6 +296,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     };
   },
 
+  buildPreviewTask: () => {
+    const { previewUrl, previewInfo, selectedFormat } = get();
+    const selected = selectedFormat == null ? null
+      : formatOptions(previewInfo?.formats ?? []).find((format) => format.formatId === selectedFormat) ?? null;
+    return get().buildTaskFromOptions(previewUrl, { ...customFormatFromSelection(selected), noPlaylist: true });
+  },
+
   startDownload: async (task) => {
     const id = String(crypto.randomUUID());
     const stub: TaskPayload = {
@@ -368,7 +382,10 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   options: defaultOptions(),
   setOptions: (p) => {
-    set((s) => ({ options: { ...s.options, ...p } }));
+    set((s) => ({
+      options: { ...s.options, ...p },
+      ...(p.preset != null || p.customFormat != null ? { selectedFormat: null } : {}),
+    }));
     if (persistTimer) clearTimeout(persistTimer);
     persistTimer = setTimeout(() => {
       const o = get().options;
@@ -383,7 +400,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         proxy: o.proxy ? o.proxy : null,
         cookiesBrowser: o.cookiesBrowser ? o.cookiesBrowser : null,
         cookiesFile: o.cookiesFile ? o.cookiesFile : null,
-      });
+      }, "options");
     }, 400);
   },
   settings: null,
@@ -430,14 +447,32 @@ export const useAppStore = create<AppState>((set, get) => ({
       /* ignore */
     }
   },
-  persistSettings: async (settings) => {
+  persistSettings: async (settings, source = "settings") => {
+    if (source === "settings" && persistTimer) {
+      clearTimeout(persistTimer);
+      persistTimer = null;
+    }
+    const previous = get().settings;
     const token = ++saveSeq;
     await saveSettings(settings);
     if (token !== saveSeq) return;
-    set({
+    set((state) => ({
       settings,
-      options: { ...get().options, preset: settings.defaultPreset || get().options.preset },
-    });
+      options: source === "options" ? state.options : {
+        ...state.options,
+        ...(settings.defaultPreset !== previous?.defaultPreset ? { preset: settings.defaultPreset || state.options.preset } : {}),
+        outDir: settings.outDir,
+        outTemplate: settings.outTemplate,
+        concurrentFragments: settings.concurrentFragments,
+        limitRate: settings.limitRate ?? "",
+        proxy: settings.proxy ?? "",
+        cookiesBrowser: settings.cookiesBrowser ?? "",
+        cookiesFile: settings.cookiesFile ?? "",
+      },
+      ...(source === "settings" && settings.defaultPreset !== previous?.defaultPreset ? { selectedFormat: null } : {}),
+    }));
+    void get().refresh();
+    void get().refreshCommand();
   },
 
   settingsOpen: false,

@@ -4,8 +4,10 @@ $yt = Get-ChildItem -Path $Root -Recurse -Filter "yt-dlp.exe" -ErrorAction Silen
     Where-Object { $_.Directory.Name -eq "code" } | Select-Object -First 1
 $ff = Get-ChildItem -Path $Root -Recurse -Filter "ffmpeg.exe" -ErrorAction SilentlyContinue |
     Where-Object { $_.Directory.Name -eq "code" } | Select-Object -First 1
-if (-not $yt -or -not $ff) { throw "bundled engines missing under $Root/**/code/" }
-foreach ($f in @($yt, $ff)) {
+$re = Get-ChildItem -Path $Root -Recurse -Filter "N_m3u8DL-RE.exe" -ErrorAction SilentlyContinue |
+    Where-Object { $_.Directory.Name -eq "code" } | Select-Object -First 1
+if (-not $yt -or -not $ff -or -not $re) { throw "bundled engines missing under $Root/**/code/" }
+foreach ($f in @($yt, $ff, $re)) {
     if ($f.Length -lt 1MB) { throw "too small: $($f.FullName)" }
     Write-Host "ok $($f.FullName) $($f.Length)"
 }
@@ -13,8 +15,10 @@ foreach ($f in @($yt, $ff)) {
 if ($LASTEXITCODE -ne 0) { throw "yt-dlp --version failed ($LASTEXITCODE): $($yt.FullName)" }
 & $ff.FullName -version
 if ($LASTEXITCODE -ne 0) { throw "ffmpeg -version failed ($LASTEXITCODE): $($ff.FullName)" }
+& $re.FullName --version
+if ($LASTEXITCODE -ne 0) { throw "N_m3u8DL-RE --version failed ($LASTEXITCODE): $($re.FullName)" }
 
-foreach ($name in @("THIRD_PARTY_NOTICES.md", "FFmpeg-GPL-3.0.txt", "yt-dlp-Unlicense.txt")) {
+foreach ($name in @("THIRD_PARTY_NOTICES.md", "FFmpeg-GPL-3.0.txt", "yt-dlp-Unlicense.txt", "N_m3u8DL-RE-MIT.txt")) {
     $legal = Get-ChildItem -Path $Root -Recurse -File -Filter $name -ErrorAction SilentlyContinue |
         Where-Object { $_.DirectoryName -match "[\\/]licenses([\\/]|$)" } |
         Select-Object -First 1

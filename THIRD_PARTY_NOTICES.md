@@ -1,7 +1,7 @@
 # Third-party notices
 
 yt-dlp GUI is licensed under the MIT License. Its installers form an aggregate
-distribution that also contains the independent yt-dlp and FFmpeg executables.
+distribution that also contains the independent yt-dlp, FFmpeg, and N_m3u8DL-RE executables.
 Those executables remain under their own licenses; the MIT License does not
 replace or restrict those terms.
 
@@ -39,3 +39,7 @@ other platforms.
 The desktop shell uses Tauri 2, WebView, React, and the Rust/JavaScript packages
 listed in `src-tauri/Cargo.lock` and `pnpm-lock.yaml`. Consult those lockfiles and
 the corresponding upstream packages for their versions and license terms.
+
+## N_m3u8DL-RE
+
+Installers bundle [N_m3u8DL-RE](https://github.com/nilaoda/N_m3u8DL-RE), licensed under MIT. The upstream license is included in `licenses/N_m3u8DL-RE-MIT.txt`. Native binaries, release archives, and the license text are pinned by SHA-256 in `engines.lock.json`; the build manifest records the actual bundled binary.

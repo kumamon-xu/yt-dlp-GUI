@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Download, Film, ListVideo, Loader2, RefreshCw } from "lucide-react";
 import { useAppStore, useT } from "../store";
-import { customFormatFromSelection, fmtDuration, formatOptions } from "../lib/format";
+import { fmtDuration, formatOptions } from "../lib/format";
 import { playlistIsTruncated, playlistItemsForSelection } from "../lib/ytdlp";
 import type { VideoInfo } from "../lib/ytdlp";
 
@@ -30,11 +30,9 @@ function VideoCard({ info }: { info: VideoInfo }) {
   const selectedFormat = useAppStore((s) => s.selectedFormat);
   const selectFormat = useAppStore((s) => s.selectFormat);
   const startDownload = useAppStore((s) => s.startDownload);
-  const buildTask = useAppStore((s) => s.buildTaskFromOptions);
-  const previewUrl = useAppStore((s) => s.previewUrl);
+  const buildPreviewTask = useAppStore((s) => s.buildPreviewTask);
   const t = useT();
-  const active = selectedFormat ?? options[0]?.formatId ?? null;
-  const activeOption = options.find((o) => o.formatId === active) ?? null;
+  const active = selectedFormat;
   const meta = [info.uploader, info.duration != null ? fmtDuration(info.duration) : null].filter(Boolean).join(" · ");
 
   return (
@@ -71,15 +69,7 @@ function VideoCard({ info }: { info: VideoInfo }) {
         </div>
       </div>
       <button
-        onClick={() => {
-          const sel = customFormatFromSelection(activeOption);
-          void startDownload(
-            buildTask(previewUrl, {
-              ...sel,
-              noPlaylist: true,
-            }),
-          );
-        }}
+        onClick={() => void startDownload(buildPreviewTask())}
         className="flex items-center justify-center gap-2 rounded-lg bg-sky-600 px-5 py-2.5 text-sm font-medium text-white hover:bg-sky-500"
       >
         <Download size={15} />

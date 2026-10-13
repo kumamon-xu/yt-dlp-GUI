@@ -31,6 +31,10 @@ pub struct GlobalSettings {
     pub engine_path: Option<String>,
     #[serde(default)]
     pub ffmpeg_path: Option<String>,
+    #[serde(default)]
+    pub m3u8dl_path: Option<String>,
+    #[serde(default = "default_use_m3u8dl")]
+    pub use_m3u8dl: bool,
     #[serde(default = "default_merge")]
     pub merge_format: String,
 }
@@ -50,6 +54,9 @@ fn default_max() -> u32 {
 fn default_merge() -> String {
     "mp4".into()
 }
+fn default_use_m3u8dl() -> bool {
+    true
+}
 
 impl Default for GlobalSettings {
     fn default() -> Self {
@@ -65,6 +72,8 @@ impl Default for GlobalSettings {
             proxy: None,
             engine_path: None,
             ffmpeg_path: None,
+            m3u8dl_path: None,
+            use_m3u8dl: true,
             merge_format: default_merge(),
         }
     }
@@ -157,6 +166,10 @@ mod tests {
         assert!(v.get("defaultPreset").is_some());
         assert!(v.get("maxConcurrentTasks").is_some());
         assert!(v.get("concurrentFragments").is_some());
+        assert_eq!(v["useM3u8dl"], true);
+        let old: GlobalSettings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(old.use_m3u8dl);
+        assert!(old.m3u8dl_path.is_none());
     }
 
     #[test]

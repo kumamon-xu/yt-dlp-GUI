@@ -27,6 +27,7 @@ LEGAL_FILES = (
     "THIRD_PARTY_NOTICES.md",
     "licenses/FFmpeg-GPL-3.0.txt",
     "licenses/yt-dlp-Unlicense.txt",
+    "licenses/N_m3u8DL-RE-MIT.txt",
 )
 
 
@@ -103,8 +104,8 @@ def main() -> int:
         if engine_doc.get("fetch_mode") != args.fetch_mode:
             sys.exit(f"engine manifest fetch mode mismatch: {engine_manifests[0]}")
         engines = engine_doc.get("engines") or []
-        if {entry.get("tool") for entry in engines} != {"yt-dlp", "ffmpeg"}:
-            sys.exit(f"engine manifest needs yt-dlp and ffmpeg: {engine_manifests[0]}")
+        if {entry.get("tool") for entry in engines} != {"yt-dlp", "ffmpeg", "N_m3u8DL-RE"}:
+            sys.exit(f"engine manifest needs yt-dlp, ffmpeg and N_m3u8DL-RE: {engine_manifests[0]}")
         for entry in engines:
             digest = str(entry.get("sha256", ""))
             if len(digest) != 64 or entry.get("bytes", 0) < 1_000_000:
@@ -127,6 +128,9 @@ def main() -> int:
             expected_hash = lock["yt-dlp"]["licenseSha256"]
             if sha256(source) != expected_hash:
                 sys.exit(f"yt-dlp license checksum mismatch: {source}")
+        if relative == "licenses/N_m3u8DL-RE-MIT.txt":
+            if sha256(source) != lock["N_m3u8DL-RE"]["licenseSha256"]:
+                sys.exit(f"N_m3u8DL-RE license checksum mismatch: {source}")
         published.append(copy_unique(source, out, names))
 
     checksum_file = out / "SHA256SUMS.txt"
