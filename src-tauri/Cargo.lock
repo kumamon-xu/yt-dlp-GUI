@@ -4849,7 +4849,7 @@ dependencies = [
 
 [[package]]
 name = "yt_dlp_gui"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aes",
  "cbc",

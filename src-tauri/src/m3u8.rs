@@ -372,6 +372,16 @@ pub fn build_args(
     Ok(args)
 }
 
+/// v0.6.0-beta resets its speed counter in the progress renderer. Spectre's
+/// non-interactive CI renderer omits that column, so --max-speed can hang.
+/// Our output reader already handles forced ANSI; normalize only this child.
+pub fn configure_process(command: &mut tokio::process::Command) {
+    command
+        .env_remove("CI")
+        .env_remove("GITHUB_ACTIONS")
+        .env("TERM", "xterm-256color");
+}
+
 pub fn clean_console(raw: &str) -> String {
     static ANSI: OnceLock<regex::Regex> = OnceLock::new();
     ANSI.get_or_init(|| {

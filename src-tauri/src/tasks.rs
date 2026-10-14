@@ -619,6 +619,9 @@ fn spawn_process(
     }
 
     let mut cmd = no_window_cmd(engine);
+    if hls.is_some() {
+        crate::m3u8::configure_process(&mut cmd);
+    }
     cmd.args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2625,19 +2628,37 @@ fn main() {{
         args.drain(i..i + 2);
         args.push("--skip-merge".into());
         let start = std::time::Instant::now();
-        let out = tokio::time::timeout(
-            std::time::Duration::from_secs(25),
-            no_window_cmd(
-                &root
-                    .join("code")
-                    .join(crate::locate::bin_name("N_m3u8DL-RE")),
-            )
+        let mut command = no_window_cmd(
+            &root
+                .join("code")
+                .join(crate::locate::bin_name("N_m3u8DL-RE")),
+        );
+        command
+            .env("CI", "true")
+            .env("GITHUB_ACTIONS", "true")
+            .env("TERM", "dumb");
+        crate::m3u8::configure_process(&mut command);
+        let child = command
             .args(&args)
-            .output(),
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap_or(0);
+        let out = match tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            child.wait_with_output(),
         )
         .await
-        .unwrap()
-        .unwrap();
+        {
+            Ok(result) => result.unwrap(),
+            Err(_) => {
+                kill_process_tree_grace(pid, std::time::Duration::ZERO);
+                panic!("RE rate regression timed out; its process tree was terminated");
+            }
+        };
         let elapsed = start.elapsed().as_secs_f64();
         assert!(
             out.status.success(),
