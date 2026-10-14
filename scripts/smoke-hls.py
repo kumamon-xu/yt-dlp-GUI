@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 FFMPEG = ROOT / "code" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
@@ -22,13 +23,34 @@ def ffmpeg(*args):
 
 class FixtureHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
-        if self.path.split("?")[0] != "/watch.html":
+        path = self.path.split("?")[0]
+        if path not in ("/watch.html", "/dynamic-watch.html"):
             if "sid=demo" not in self.headers.get("Cookie", ""):
                 self.send_error(403, "cookie required")
                 return
-            if "/watch.html" not in self.headers.get("Referer", ""):
+            if not any(page in self.headers.get("Referer", "") for page in ("/watch.html", "/dynamic-watch.html")):
                 self.send_error(403, "referer required")
                 return
+        if path.startswith("/browser-") and path.endswith(".m3u8") and self.headers.get("X-Manifest-Only") != "demo":
+            self.send_error(403, "manifest header required")
+            return
+        if path.endswith(".ts") and self.headers.get("X-Manifest-Only"):
+            self.send_error(400, "manifest header leaked to segment")
+            return
+        if path.endswith(".ts") and self.headers.get("Range"):
+            payload = pathlib.Path(self.translate_path(path)).read_bytes()
+            start, end = map(int, self.headers["Range"].removeprefix("bytes=").split("-"))
+            if start >= len(payload) or end < start:
+                self.send_error(416)
+                return
+            end = min(end, len(payload) - 1)
+            self.send_response(206)
+            self.send_header("Content-Type", "video/mp2t")
+            self.send_header("Content-Range", f"bytes {start}-{end}/{len(payload)}")
+            self.send_header("Content-Length", str(end-start+1))
+            self.end_headers()
+            self.wfile.write(payload[start:end+1])
+            return
         super().do_GET()
 
     def log_message(self, *args):
@@ -68,6 +90,28 @@ def main():
                "-t", "3", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "10", "-c:a", "aac",
                "-hls_time", "1", "-hls_list_size", "0", "-hls_key_info_file", str(fixture / "keyinfo.txt"), str(fixture / "encrypted.m3u8"))
         (fixture / "watch.html").write_text('<html><title>Fixture.with.dots</title><video controls src="master.m3u8"></video></html>')
+        shutil.copyfile(fixture / "video.m3u8", fixture / "browser-video.m3u8")
+        shutil.copyfile(fixture / "encrypted.m3u8", fixture / "browser-encrypted.m3u8")
+        (fixture / "dynamic-watch.html").write_text('''<title>Dynamic HLS fixture</title><video></video><script>
+          setTimeout(async () => {
+            const params = new URLSearchParams(location.search);
+            const name = params.has('encrypted') ? 'browser-encrypted' : params.has('range') ? 'browser-ranged' : 'browser-video';
+            const url = location.origin + '/' + [name, '.m3u8'].join('');
+            document.querySelector('video').src = url;
+            await fetch(url, {headers: {'X-Manifest-Only':'demo'}});
+          },200);
+        </script>''')
+        ranges, payload, offset = [], bytearray(), 0
+        for line in (fixture / "video.m3u8").read_text().splitlines():
+            if line and not line.startswith("#"):
+                segment = (fixture / line).read_bytes()
+                ranges.extend((f"#EXT-X-BYTERANGE:{len(segment)}@{offset}", "ranged.ts"))
+                payload.extend(segment)
+                offset += len(segment)
+            else:
+                ranges.append(line)
+        (fixture / "ranged.ts").write_bytes(payload)
+        (fixture / "browser-ranged.m3u8").write_text("\n".join(ranges) + "\n")
         (fixture / "cookies.txt").write_text('# Netscape HTTP Cookie File\n127.0.0.1\tFALSE\t/\tFALSE\t0\tsid\tdemo\n')
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(FixtureHandler, directory=str(fixture)))
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -93,11 +137,21 @@ def main():
             (fixture / target).write_text(text)
         env = {**os.environ, "TEST_HLS_URL": f"http://127.0.0.1:{server.server_port}", "TEST_HLS_COOKIES": str(fixture / "cookies.txt"),
                "TEST_HLS_RATE_BYTES": str(rate_bytes), "TEST_HLS_BAD_ORIGIN": bad_origin}
+        browser_paths = [shutil.which(name) for name in ("google-chrome", "chromium", "chromium-browser", "microsoft-edge")]
+        browser_paths += [str(pathlib.Path(base) / relative) for base in (os.environ.get("PROGRAMFILES", ""), os.environ.get("PROGRAMFILES(X86)", ""))
+                          for relative in ("Microsoft/Edge/Application/msedge.exe", "Google/Chrome/Application/chrome.exe") if base]
+        browser_paths += ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"]
+        browser = next((p for p in browser_paths if p and pathlib.Path(p).is_file()), None)
+        if browser:
+            env["TEST_HLS_BROWSER_PATH"] = browser
+        else:
+            print("Installed Chromium browser unavailable: optional dynamic-player/RE service smoke skipped.")
         try:
             result = subprocess.run(["cargo", "test", "--manifest-path", str(ROOT / "src-tauri/Cargo.toml"), "--lib",
                 "real_hls_", "--", "--ignored", "--nocapture"], env=env, cwd=ROOT, creationflags=CREATE_NO_WINDOW,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            print(result.stdout.decode("utf-8", "replace"))
+            sys.stdout.buffer.write(result.stdout.decode("utf-8", "replace").encode("utf-8"))
+            sys.stdout.flush()
             return result.returncode
         finally:
             server.shutdown()

@@ -14,6 +14,7 @@ use url::Url;
 
 const SAMPLE_LIMIT: usize = 64 * 1024;
 const MANIFEST_LIMIT: usize = 1024 * 1024;
+pub type Progress = Arc<dyn Fn(&str) + Send + Sync>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -114,14 +115,22 @@ pub struct PreparedInput {
     pub messages: Vec<String>,
     pub domains: Vec<String>,
     pub playlist_switches: usize,
+    pub engine_headers: BTreeMap<String, String>,
+    pub uses_local_service: bool,
     _files: Option<Arc<TemporaryManifests>>,
+    _relay: Option<Arc<crate::hls_relay::Relay>>,
 }
 
+#[derive(Clone)]
 pub struct RequestContext {
     client: reqwest::Client,
     source: Url,
     headers: BTreeMap<String, String>,
     cookies: Option<String>,
+    request_headers: BTreeMap<String, BTreeMap<String, String>>,
+    browser: Option<Arc<crate::hls_browser::Transport>>,
+    progress: Progress,
+    browser_domains: Arc<std::sync::Mutex<BTreeSet<String>>>,
 }
 
 fn network_error(e: reqwest::Error) -> ProbeError {
@@ -179,7 +188,43 @@ impl RequestContext {
             source: http_url(&source.url)?,
             headers: source.headers.clone(),
             cookies: cookie_text,
+            request_headers: source.request_headers.clone(),
+            browser: source.browser.clone(),
+            progress: Arc::new(|_| {}),
+            browser_domains: Default::default(),
         })
+    }
+
+    fn observed_headers(&self, url: &Url) -> BTreeMap<String, String> {
+        if let Some(headers) = self.request_headers.get(url.as_str()) {
+            return headers.clone();
+        }
+        let parent = url.path().rsplit_once('/').map(|p| p.0);
+        let extension = Path::new(url.path()).extension().and_then(|s| s.to_str());
+        if !matches!(extension, Some("ts" | "m4s" | "key" | "aac")) {
+            return BTreeMap::new();
+        }
+        let mut matches = self.request_headers.iter().filter_map(|(raw, headers)| {
+            let observed = Url::parse(raw).ok()?;
+            (observed.origin() == url.origin()
+                && observed.path().rsplit_once('/').map(|p| p.0) == parent
+                && Path::new(observed.path())
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    == extension)
+                .then_some(headers)
+        });
+        let Some(first) = matches.next() else {
+            return BTreeMap::new();
+        };
+        // Expand a consistent player request pattern only inside the same asset
+        // directory/origin/type. Never expand raw Cookies beyond their exact URL.
+        let mut result = first.clone();
+        result.retain(|k, _| !k.eq_ignore_ascii_case("cookie"));
+        if matches.any(|headers| result.iter().any(|(k, v)| headers.get(k) != Some(v))) {
+            return BTreeMap::new();
+        }
+        result
     }
 
     fn cookie(&self, url: &Url) -> Option<String> {
@@ -201,10 +246,47 @@ impl RequestContext {
             .flatten()
     }
 
+    pub(crate) fn report_resource_failure(&self, url: &Url, reason: &str) {
+        (self.progress)(&format!(
+            "HLS 资源服务：{}（{}）",
+            url.origin().ascii_serialization(),
+            reason
+        ));
+    }
+
+    async fn browser_get(
+        &self,
+        url: &Url,
+        range: Option<(u64, u64)>,
+        limit: usize,
+        complete: bool,
+    ) -> Result<(Url, Vec<u8>), ProbeError> {
+        let browser = self
+            .browser
+            .as_ref()
+            .ok_or_else(|| ProbeError::invalid("浏览器资源通道不可用"))?;
+        let mut headers = self.headers.clone();
+        headers.retain(|name, _| !is_scoped_header(name) || url.origin() == self.source.origin());
+        headers.extend(self.observed_headers(url));
+        if let Some(cookie) = self.cookie(url) {
+            headers.insert("Cookie".into(), cookie);
+        }
+        let domain = url.origin().ascii_serialization();
+        if self.browser_domains.lock().unwrap().insert(domain.clone()) {
+            (self.progress)(&format!(
+                "HLS 网络通道：{domain} 原生请求失败，使用浏览器网络栈取回资源"
+            ));
+        }
+        browser.get(url, &headers, range, limit, complete).await
+    }
+
     pub(crate) fn allows_engine_headers(&self, url: &Url) -> bool {
-        // RE accepts one global header set. Until the request service exists,
-        // reject switches that need different scoped credentials.
-        self.headers.iter().all(|(k, v)| {
+        if self.browser.is_some() {
+            return true;
+        } // The local service applies headers per request.
+          // RE accepts one global header set. Until the request service exists,
+          // reject switches that need different scoped credentials.
+        let engine = self.headers.iter().all(|(k, v)| {
             if k.eq_ignore_ascii_case("cookie") {
                 self.cookie(url).as_ref() == Some(v)
             } else if is_scoped_header(k) {
@@ -215,7 +297,22 @@ impl RequestContext {
         }) && (self.cookie(url).is_none()
             || self.headers.iter().any(|(k, v)| {
                 k.eq_ignore_ascii_case("cookie") && self.cookie(url).as_ref() == Some(v)
-            }))
+            }));
+        engine
+            && self
+                .request_headers
+                .get(url.as_str())
+                .is_none_or(|headers| {
+                    headers.iter().all(|(k, v)| {
+                        // The frozen local playlist needs no manifest credentials. A segment
+                        // requiring scoped credentials cannot use RE's global header set.
+                        !is_scoped_header(k)
+                            || self
+                                .headers
+                                .iter()
+                                .any(|(name, value)| name.eq_ignore_ascii_case(k) && value == v)
+                    })
+                })
     }
 
     pub(crate) async fn get(
@@ -245,6 +342,22 @@ impl RequestContext {
                     HeaderValue::from_str(v).map_err(|_| ProbeError::invalid("请求头无效"))?;
                 request = request.header(name, value);
             }
+            let observed = self.observed_headers(&url);
+            {
+                for (k, v) in &observed {
+                    if k.eq_ignore_ascii_case("host")
+                        || k.eq_ignore_ascii_case("range")
+                        || k.eq_ignore_ascii_case("accept-encoding")
+                    {
+                        continue;
+                    }
+                    request = request.header(
+                        HeaderName::from_bytes(k.as_bytes())
+                            .map_err(|_| ProbeError::invalid("请求头无效"))?,
+                        HeaderValue::from_str(v).map_err(|_| ProbeError::invalid("请求头无效"))?,
+                    );
+                }
+            }
             if let Some(cookie) = self.cookie(&url) {
                 request = request.header("Cookie", cookie);
             }
@@ -255,7 +368,15 @@ impl RequestContext {
                     .ok_or_else(|| ProbeError::invalid("字节范围溢出"))?;
                 request = request.header(RANGE, format!("bytes={offset}-{end}"));
             }
-            let mut response = request.send().await.map_err(network_error)?;
+            let mut response = match request.send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    if self.browser.is_some() {
+                        return self.browser_get(&url, range, limit, complete).await;
+                    }
+                    return Err(network_error(error));
+                }
+            };
             let status = response.status().as_u16();
             if [301, 302, 303, 307, 308].contains(&status) {
                 let location = response
@@ -277,6 +398,9 @@ impl RequestContext {
                 continue;
             }
             if status != 200 && status != 206 {
+                if self.browser.is_some() && matches!(status, 401 | 403) {
+                    return self.browser_get(&url, range, limit, complete).await;
+                }
                 return Err(ProbeError {
                     reason: format!("HTTP {status}"),
                     recoverable: matches!(status, 404 | 410 | 500..=599),
@@ -598,6 +722,60 @@ fn samples(resources: &[Resource]) -> Vec<Resource> {
         .collect()
 }
 
+// Compare the ordered asset paths and timeline, not temporary CDN origins/signatures.
+// Equal duration alone is insufficient: another episode must never be accepted.
+pub(crate) fn asset_identity(url: &Url) -> String {
+    let stable: Vec<_> = url
+        .query_pairs()
+        .filter(|(key, _)| {
+            let key = key.to_ascii_lowercase();
+            !key.starts_with("x-amz-")
+                && !matches!(
+                    key.as_str(),
+                    "sig"
+                        | "signature"
+                        | "token"
+                        | "auth_key"
+                        | "expires"
+                        | "expiry"
+                        | "expire"
+                        | "policy"
+                        | "key-pair-id"
+                        | "hdnts"
+                        | "hdntl"
+                )
+        })
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    format!(
+        "{}|{}",
+        url.path(),
+        serde_json::to_string(&stable).unwrap_or_default()
+    )
+}
+fn media_identity(lines: &[String], base: &Url) -> Result<Vec<String>, String> {
+    let mut identity = Vec::new();
+    for line in lines {
+        if line.is_empty() || line.starts_with('#') && !line.starts_with("#EXT") {
+            continue;
+        }
+        if !line.starts_with('#') {
+            identity.push(asset_identity(
+                &base.join(line).map_err(|_| "清单身份地址无效")?,
+            ));
+        } else if line.contains("URI=\"") {
+            let uri = attr(line, "URI").ok_or("清单身份缺少 URI")?;
+            let path = asset_identity(&base.join(&uri).map_err(|_| "清单身份地址无效")?);
+            identity.push(replace_uri(line, &path)?);
+        } else if line.starts_with("#EXTINF:") {
+            identity.push(line.split(',').next().unwrap_or(line).to_string());
+        } else {
+            identity.push(line.clone());
+        }
+    }
+    Ok(identity)
+}
+
 async fn probe(
     ctx: &RequestContext,
     resource: &Resource,
@@ -640,7 +818,7 @@ async fn probe(
     }
 }
 
-/// Candidates come from validated user rules or supported site adapters. The returned rule has
+/// Candidates come from validated user rules. The returned rule has
 /// passed all representative resources in its scope, not just a hostname check.
 pub(crate) async fn try_alternative_domain(
     ctx: &RequestContext,
@@ -687,21 +865,27 @@ struct CheckState {
     retryable_failure: bool,
     domains: BTreeSet<String>,
     playlist_switches: usize,
+    progress: Progress,
+    source: HlsSource,
+    browser_path: Option<String>,
+    browser_refreshed: bool,
+    identities: BTreeMap<String, Vec<String>>,
+    relay: Option<Arc<crate::hls_relay::Relay>>,
+    verify_identity: bool,
+    authorization_failure: bool,
 }
 
 impl CheckState {
+    fn log(&mut self, message: String) {
+        (self.progress)(&message);
+        self.messages.push(message);
+    }
+
     async fn media(&mut self, lines: &mut [String], base: &Url) -> Result<(), String> {
         let resources = media_resources(lines, base)?;
         for resource in &resources {
             self.domains
                 .insert(resource.url.origin().ascii_serialization());
-            if self.auto_discovery {
-                if let Some(rule) = crate::hls_discovery::site_rule(base, &resource.url) {
-                    if !self.rules.contains(&rule) && self.rules.len() < 64 {
-                        self.rules.push(rule);
-                    }
-                }
-            }
         }
         if !resources.iter().any(|r| matches!(r.kind, Kind::Segment)) {
             return Err("点播清单没有分片".into());
@@ -713,15 +897,42 @@ impl CheckState {
         if representative.len() > 48 {
             return Err("密钥或初始化文件数量超过检查上限".into());
         }
+        self.log(format!(
+            "HLS 检查：{}，{} 个分片，抽查首/中/尾及 {} 个密钥/初始化文件",
+            base.host_str().unwrap_or(""),
+            resources
+                .iter()
+                .filter(|r| matches!(r.kind, Kind::Segment))
+                .count(),
+            representative
+                .iter()
+                .filter(|r| !matches!(r.kind, Kind::Segment))
+                .count()
+        ));
         for resource in &representative {
             let target = self.plan.route(&resource.url);
             let mut result = probe(&self.context, resource, &target, &self.keys).await;
-            if result.as_ref().is_err_and(|e| e.recoverable) {
-                tokio::time::sleep(Duration::from_millis(250)).await;
+            for attempt in 1..4 {
+                let Some(error) = result.as_ref().err().filter(|e| e.recoverable) else {
+                    break;
+                };
+                self.log(format!(
+                    "HLS {}检查：{}（{}），重试 {attempt}/3",
+                    if matches!(resource.kind, Kind::Key) {
+                        "密钥"
+                    } else {
+                        "分片"
+                    },
+                    target.host_str().unwrap_or(""),
+                    error.reason
+                ));
+                tokio::time::sleep(Duration::from_millis(250 * (1 << (attempt - 1)))).await;
                 result = probe(&self.context, resource, &target, &self.keys).await;
             }
             if let Err(error) = result {
                 self.retryable_failure = error.recoverable;
+                self.authorization_failure =
+                    matches!(error.reason.as_str(), "HTTP 401" | "HTTP 403");
                 if !error.recoverable {
                     return Err(format!(
                         "HLS 启动检查失败：{}（{}）；请检查授权、代理或清单有效期",
@@ -736,13 +947,26 @@ impl CheckState {
                 } else {
                     representative.clone()
                 };
-                let rule = try_alternative_domain(&self.context,resource,&checks,&self.rules,&self.keys).await
-                    .ok_or_else(|| format!("HLS 启动检查失败：{}（{}），没有验证通过的可信备用地址；可在设置中配置备用映射", target.host_str().unwrap_or(""),error.reason))?;
+                let rule = try_alternative_domain(
+                    &self.context,
+                    resource,
+                    &checks,
+                    &self.rules,
+                    &self.keys,
+                )
+                .await
+                .ok_or_else(|| {
+                    format!(
+                        "HLS 启动检查失败：{}（{}），没有验证通过的备用地址",
+                        target.host_str().unwrap_or(""),
+                        error.reason
+                    )
+                })?;
                 let candidate = rule.candidate(&resource.url).unwrap();
                 let bytes = probe(&self.context, resource, &candidate, &self.keys)
                     .await
                     .map_err(|_| "备用地址复查失败")?;
-                self.messages.push(format!(
+                self.log(format!(
                     "HLS 启动检查：{} → {}，备用地址已通过分片验证",
                     target.origin().ascii_serialization(),
                     candidate.origin().ascii_serialization()
@@ -787,10 +1011,13 @@ impl CheckState {
                         .into(),
                 );
             }
-            lines[resource.line] = replace_uri(
-                &lines[resource.line],
-                self.plan.route(&resource.url).as_str(),
-            )?;
+            let routed = self.plan.route(&resource.url);
+            let engine_url = if let Some(relay) = &self.relay {
+                relay.register(routed)?
+            } else {
+                routed.to_string()
+            };
+            lines[resource.line] = replace_uri(&lines[resource.line], &engine_url)?;
         }
         Ok(())
     }
@@ -800,17 +1027,91 @@ impl CheckState {
         url: Url,
         cfg: &'a TaskConfig,
         depth: usize,
+        slot: String,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Option<String>, String>> + Send + 'a>,
     > {
         Box::pin(async move {
             let plan = self.plan.clone();
             let keys = self.keys.clone();
-            let message_count = self.messages.len();
+            let verifying = self.verify_identity;
             let switches = self.playlist_switches;
             self.retryable_failure = false;
-            let result = self.playlist_once(url.clone(), cfg, depth).await;
-            if result.is_ok() || !self.retryable_failure {
+            self.authorization_failure = false;
+            let result = self
+                .playlist_once(url.clone(), cfg, depth, slot.clone())
+                .await;
+            let recoverable = self.retryable_failure;
+            let refresh_authorization = self.auto_discovery
+                && self.authorization_failure
+                && depth == 0
+                && !crate::m3u8::is_m3u8_url(&cfg.url);
+            if result.is_ok() || !self.retryable_failure && !refresh_authorization {
+                return result;
+            }
+            // Refresh the authoritative URL, without inventing query parameters or
+            // DNS names. Providers can return a new CDN allocation for the same VOD.
+            if self.auto_discovery {
+                for attempt in 1..=if recoverable { 2 } else { 0 } {
+                    self.verify_identity = true;
+                    self.log(format!(
+                        "HLS 自动分析：刷新原清单 {attempt}/2，保留视频和所选流身份"
+                    ));
+                    self.plan = plan.clone();
+                    self.keys = keys.clone();
+                    self.retryable_failure = false;
+                    if let Ok(Some(input)) = self
+                        .playlist_once(url.clone(), cfg, depth, slot.clone())
+                        .await
+                    {
+                        self.log("HLS 原清单刷新后，分片验证通过".into());
+                        self.verify_identity = verifying;
+                        return Ok(Some(input));
+                    }
+                    if !self.retryable_failure {
+                        break;
+                    }
+                }
+                if depth == 0 && !self.browser_refreshed && !crate::m3u8::is_m3u8_url(&cfg.url) {
+                    self.browser_refreshed = true;
+                    self.log("HLS 自动分析：重新加载原页面，观察播放器当前请求".into());
+                    match crate::hls_browser::resolve(
+                        cfg,
+                        Some(&self.source),
+                        self.browser_path.as_deref(),
+                        self.progress.clone(),
+                    )
+                    .await
+                    {
+                        Ok(source) => {
+                            let cookie_text = source
+                                .cookie_text
+                                .clone()
+                                .or_else(|| self.context.cookies.clone());
+                            self.context = RequestContext::new(cfg, &source, cookie_text)?;
+                            self.context.progress = self.progress.clone();
+                            self.relay = Some(crate::hls_relay::start(self.context.clone()).await?);
+                            self.source = source.clone();
+                            self.plan = plan.clone();
+                            self.keys = keys.clone();
+                            self.retryable_failure = false;
+                            self.verify_identity = true;
+                            if let Ok(Some(input)) = self
+                                .playlist_once(http_url(&source.url)?, cfg, depth, slot.clone())
+                                .await
+                            {
+                                self.playlist_switches += 1;
+                                self.log("HLS 页面刷新后，同一视频清单及分片验证通过".into());
+                                self.verify_identity = verifying;
+                                return Ok(Some(input));
+                            }
+                        }
+                        Err(error) => self.log(format!("HLS 浏览器分析：{error}")),
+                    }
+                }
+            }
+            self.verify_identity = verifying;
+            if !recoverable {
                 return result;
             }
             let mut candidates = if self.auto_discovery {
@@ -821,13 +1122,7 @@ impl CheckState {
             } else {
                 Vec::new()
             };
-            let mut rules = self.rules.clone();
-            if self.auto_discovery {
-                if let Some(rule) = crate::hls_discovery::site_rule(&url, &url) {
-                    rules.push(rule);
-                }
-            }
-            for rule in rules {
+            for rule in self.rules.clone() {
                 if let Some(candidate) = rule.candidate(&url) {
                     if !candidates.contains(&candidate) {
                         candidates.push(candidate);
@@ -840,22 +1135,27 @@ impl CheckState {
                 }
                 self.plan = plan.clone();
                 self.keys = keys.clone();
-                self.messages.truncate(message_count);
                 self.playlist_switches = switches;
                 self.retryable_failure = false;
-                if let Ok(Some(input)) = self.playlist_once(candidate.clone(), cfg, depth).await {
+                // Provider-declared identical streams may use different asset paths.
+                self.verify_identity = false;
+                if let Ok(Some(input)) = self
+                    .playlist_once(candidate.clone(), cfg, depth, slot.clone())
+                    .await
+                {
                     self.playlist_switches += 1;
-                    self.messages.push(format!(
+                    self.log(format!(
                         "HLS 自动分析：{} → {}，同一流备用清单及分片验证通过",
                         url.origin().ascii_serialization(),
                         candidate.origin().ascii_serialization()
                     ));
+                    self.verify_identity = verifying;
                     return Ok(Some(input));
                 }
             }
             self.plan = plan;
             self.keys = keys;
-            self.messages.truncate(message_count);
+            self.verify_identity = verifying;
             self.playlist_switches = switches;
             result
         })
@@ -866,22 +1166,29 @@ impl CheckState {
         url: Url,
         cfg: &'a TaskConfig,
         depth: usize,
+        slot: String,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Option<String>, String>> + Send + 'a>,
     > {
         Box::pin(async move {
-            if depth > 4 || self.nodes >= 16 {
+            if depth > 4 || self.nodes >= 32 {
                 return Err("HLS 清单嵌套或数量超过检查上限".into());
             }
             self.nodes += 1;
             let node_id = self.nodes;
             self.domains.insert(url.origin().ascii_serialization());
+            self.log(format!(
+                "HLS 获取清单：{}",
+                url.origin().ascii_serialization()
+            ));
             let (base, bytes) = self
                 .context
                 .get(&url, None, MANIFEST_LIMIT, true)
                 .await
                 .map_err(|e| {
                     self.retryable_failure = e.recoverable;
+                    self.authorization_failure =
+                        matches!(e.reason.as_str(), "HTTP 401" | "HTTP 403");
                     format!(
                         "HLS 清单检查失败：{}（{}）",
                         url.host_str().unwrap_or(""),
@@ -895,8 +1202,7 @@ impl CheckState {
                 return Err("HLS 清单返回了无效内容".into());
             }
             if lines.iter().any(|s| s.starts_with("#EXT-X-DEFINE:")) {
-                self.messages
-                    .push("HLS 启动检查：包含变量定义，沿用原清单交给 RE 处理".into());
+                self.log("HLS 启动检查：包含变量定义，沿用原清单交给 RE 处理".into());
                 return Ok(None);
             }
             if lines.iter().any(|s| s.starts_with("#EXT-X-STREAM-INF:")) {
@@ -909,17 +1215,30 @@ impl CheckState {
                     );
                 }
                 let refs = select_master(&mut lines, cfg)?;
-                for (line, child) in refs {
+                let identity = media_identity(&lines, &base)?;
+                let id = format!("master:{slot}");
+                if self.verify_identity
+                    && self
+                        .identities
+                        .get(&id)
+                        .is_some_and(|previous| previous != &identity)
+                {
+                    return Err("刷新主清单无法准确保留已选的编码、帧率和音轨".into());
+                }
+                self.identities.entry(id).or_insert(identity);
+                for (stream, (line, child)) in refs.into_iter().enumerate() {
                     let child_url = base.join(&child).map_err(|_| "子清单地址无效")?;
-                    let Some(input) = self.playlist(child_url, cfg, depth + 1).await? else {
+                    let Some(input) = self
+                        .playlist(child_url, cfg, depth + 1, format!("{slot}/{stream}"))
+                        .await?
+                    else {
                         return Ok(None);
                     };
                     lines[line] = replace_uri(&lines[line], &input)?;
                 }
             } else {
                 if !lines.iter().any(|s| s == "#EXT-X-ENDLIST") {
-                    self.messages
-                        .push("HLS 启动检查：直播/未结束清单沿用 RE，暂不切换线路".into());
+                    self.log("HLS 启动检查：直播/未结束清单沿用 RE，暂不切换线路".into());
                     return Ok(None);
                 }
                 if lines.iter().any(|s| {
@@ -932,9 +1251,22 @@ impl CheckState {
                     s.starts_with("#EXT-X-BYTERANGE:")
                         || s.starts_with("#EXT-X-MAP:") && attr(s, "BYTERANGE").is_some()
                 })) {
-                    self.messages.push("HLS 启动检查：此加密方式沿用 RE".into());
+                    self.log("HLS 启动检查：此加密方式沿用 RE".into());
                     return Ok(None);
                 }
+                let identity = media_identity(&lines, &base)?;
+                let id = format!("media:{slot}");
+                if self.verify_identity
+                    && self
+                        .identities
+                        .get(&id)
+                        .is_some_and(|previous| previous != &identity)
+                {
+                    self.retryable_failure = false;
+                    self.log("HLS 刷新被拒绝：分片路径、时长或加密信息与原视频不一致".into());
+                    return Err("刷新清单无法证明属于同一视频和所选流".into());
+                }
+                self.identities.entry(id).or_insert(identity);
                 self.media(&mut lines, &base).await?;
             }
             let path = self.directory.0.join(format!("playlist-{node_id}.m3u8"));
@@ -1039,6 +1371,7 @@ fn select_master(lines: &mut [String], cfg: &TaskConfig) -> Result<Vec<(usize, S
     Ok(refs)
 }
 
+#[cfg(test)]
 pub async fn prepare_with_discovery(
     cfg: &TaskConfig,
     source: &HlsSource,
@@ -1046,6 +1379,30 @@ pub async fn prepare_with_discovery(
     directory: &Path,
     cookie_text: Option<String>,
     auto_discovery: bool,
+) -> Result<PreparedInput, String> {
+    prepare_with_progress(
+        cfg,
+        source,
+        rules,
+        directory,
+        cookie_text,
+        auto_discovery,
+        None,
+        Arc::new(|_| {}),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_with_progress(
+    cfg: &TaskConfig,
+    source: &HlsSource,
+    rules: &[MirrorRule],
+    directory: &Path,
+    cookie_text: Option<String>,
+    auto_discovery: bool,
+    browser_path: Option<&str>,
+    progress: Progress,
 ) -> Result<PreparedInput, String> {
     validate_rules(rules)?;
     std::fs::create_dir_all(directory).map_err(|_| "无法创建 HLS 临时清单目录")?;
@@ -1056,8 +1413,16 @@ pub async fn prepare_with_discovery(
         std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
             .map_err(|_| "无法设置临时清单权限")?;
     }
+    let mut context = RequestContext::new(cfg, source, cookie_text)?;
+    context.progress = progress.clone();
+    let relay = if source.browser.is_some() {
+        progress("HLS 网络通道：使用本机资源服务，按资源应用请求头；原生 TLS 失败时由浏览器取回");
+        Some(crate::hls_relay::start(context.clone()).await?)
+    } else {
+        None
+    };
     let mut state = CheckState {
-        context: RequestContext::new(cfg, source, cookie_text)?,
+        context,
         rules: rules.to_vec(),
         plan: RecoveryPlan::default(),
         keys: BTreeMap::new(),
@@ -1069,6 +1434,14 @@ pub async fn prepare_with_discovery(
         retryable_failure: false,
         domains: BTreeSet::new(),
         playlist_switches: 0,
+        progress,
+        source: source.clone(),
+        browser_path: browser_path.map(String::from),
+        browser_refreshed: false,
+        identities: BTreeMap::new(),
+        relay,
+        verify_identity: false,
+        authorization_failure: false,
     };
     let url = http_url(&source.url)?;
     let checked = tokio::time::timeout(Duration::from_secs(90), async {
@@ -1099,30 +1472,54 @@ pub async fn prepare_with_discovery(
                 }
             }
         }
-        state.playlist(url, cfg, 0).await
+        state.playlist(url, cfg, 0, "root".into()).await
     })
     .await
-    .map_err(|_| "HLS 启动检查超时（90s）")??;
+    .map_err(|_| "HLS 启动检查超时（90s）");
+    let checked = match checked {
+        Ok(Ok(checked)) => checked,
+        result => {
+            let error = match result {
+                Ok(Err(error)) => error,
+                Err(error) => error.to_string(),
+                _ => unreachable!(),
+            };
+            state.log(format!("HLS 检查失败：{error}"));
+            return Err(error.to_string());
+        }
+    };
     if let Some(input) = checked {
-        state
-            .messages
-            .push("HLS 点播启动检查通过（首、中、尾分片及密钥/初始化文件）".into());
+        state.log("HLS 点播启动检查通过（首、中、尾分片及密钥/初始化文件）".into());
         Ok(PreparedInput {
             input,
             plan: state.plan,
             messages: state.messages,
             domains: state.domains.into_iter().collect(),
             playlist_switches: state.playlist_switches,
+            engine_headers: if state.relay.is_some() {
+                BTreeMap::new()
+            } else {
+                state.context.headers
+            },
+            uses_local_service: state.relay.is_some(),
             _files: Some(guard),
+            _relay: state.relay,
         })
     } else {
+        if state.source.browser.is_some() {
+            state.log("HLS 浏览器资源服务暂不支持此直播、变量或加密清单".into());
+            return Err("浏览器解析的流需要本机资源服务；当前服务仅支持可验证的点播清单，不支持直播、变量或此加密方式".into());
+        }
         Ok(PreparedInput {
             input: source.url.clone(),
             plan: RecoveryPlan::default(),
             messages: state.messages,
             domains: state.domains.into_iter().collect(),
             playlist_switches: 0,
+            engine_headers: source.headers.clone(),
+            uses_local_service: false,
             _files: None,
+            _relay: None,
         })
     }
 }
@@ -1219,6 +1616,389 @@ mod tests {
             data[i * 188] = 0x47;
         }
         data
+    }
+
+    #[test]
+    fn player_header_patterns_stay_on_the_exact_origin_asset_directory_and_type() {
+        let mut source = crate::m3u8::direct_source("https://cdn.test/asset/index.m3u8");
+        source.request_headers.insert(
+            "https://cdn.test/asset/a.ts?sig=old".into(),
+            BTreeMap::from([
+                ("x-segment-auth".into(), "private".into()),
+                ("cookie".into(), "sid=secret".into()),
+            ]),
+        );
+        let ctx = RequestContext::new(&Default::default(), &source, None).unwrap();
+        let headers =
+            ctx.observed_headers(&Url::parse("https://cdn.test/asset/b.ts?sig=new").unwrap());
+        assert_eq!(headers.get("x-segment-auth").unwrap(), "private");
+        assert!(!headers.contains_key("cookie"));
+        for url in [
+            "https://other.test/asset/b.ts",
+            "https://cdn.test/other/b.ts",
+            "https://cdn.test/asset/key.key",
+        ] {
+            assert!(ctx.observed_headers(&Url::parse(url).unwrap()).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn authoritative_refresh_discovers_a_new_cdn_without_rules() {
+        use std::sync::atomic::AtomicUsize;
+        let old = server(|_| (503, vec![], vec![]));
+        let healthy = server(|_| (200, vec![], ts()));
+        let count = Arc::new(AtomicUsize::new(0));
+        let (a, b, n) = (old.url.clone(), healthy.url.clone(), count.clone());
+        let provider = server(move |_| {
+            (
+                200,
+                vec![],
+                vod(if n.fetch_add(1, Ordering::SeqCst) == 0 {
+                    &a
+                } else {
+                    &b
+                })
+                .into_bytes(),
+            )
+        });
+        let url = format!("{}/index.m3u8", provider.url);
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let log = messages.clone();
+        let ready = prepare_with_progress(
+            &cfg(&url),
+            &crate::m3u8::direct_source(&url),
+            &[],
+            &temporary(),
+            None,
+            true,
+            None,
+            Arc::new(move |s| log.lock().unwrap().push(s.to_string())),
+        )
+        .await
+        .unwrap();
+        assert!(read(&ready).contains(&healthy.url));
+        assert!(!read(&ready).contains(&old.url));
+        assert!(ready.plan.routes.is_empty());
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert!(messages.lock().unwrap().iter().any(|s| s.contains("重试")));
+        assert!(messages
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.contains("刷新后")));
+    }
+
+    #[tokio::test]
+    async fn master_and_tracks_with_the_same_url_path_have_distinct_identities() {
+        let video = server(|r| {
+            if r.starts_with("GET /index.m3u8 ") {
+                (200, vec![], vod("/video").into_bytes())
+            } else {
+                (200, vec![], ts())
+            }
+        });
+        let audio = server(|r| {
+            if r.starts_with("GET /index.m3u8 ") {
+                (200, vec![], vod("/audio").into_bytes())
+            } else {
+                (200, vec![], ts())
+            }
+        });
+        let text = format!("#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"English\",DEFAULT=YES,URI=\"{}/index.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=100,CODECS=\"avc1,mp4a\",AUDIO=\"audio\"\n{}/index.m3u8\n",audio.url,video.url);
+        let root = server(move |_| (200, vec![], text.clone().into_bytes()));
+        let url = format!("{}/index.m3u8", root.url);
+        let checked = prepare_with_discovery(
+            &cfg(&url),
+            &crate::m3u8::direct_source(&url),
+            &[],
+            &temporary(),
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(read(&checked).contains("EXT-X-MEDIA"));
+        assert!(video
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.contains("/video/video/s2.ts")));
+        assert!(audio
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.contains("/audio/video/s2.ts")));
+    }
+
+    #[tokio::test]
+    async fn refresh_cannot_replace_the_video_even_when_new_segments_are_healthy() {
+        use std::sync::atomic::AtomicUsize;
+        let old = server(|_| (503, vec![], vec![]));
+        let healthy = server(|_| (200, vec![], ts()));
+        let (a, b) = (old.url.clone(), healthy.url.clone());
+        let count = AtomicUsize::new(0);
+        let provider = server(move |_| {
+            let text = if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                vod(&a)
+            } else {
+                vod(&b).replace("/video/", "/different-episode/")
+            };
+            (200, vec![], text.into_bytes())
+        });
+        let url = format!("{}/index.m3u8?secret=hidden", provider.url);
+        let directory = temporary();
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let output = lines.clone();
+        assert!(prepare_with_progress(
+            &cfg(&url),
+            &crate::m3u8::direct_source(&url),
+            &[],
+            &directory,
+            None,
+            true,
+            None,
+            Arc::new(move |s| output.lock().unwrap().push(s.to_string()))
+        )
+        .await
+        .is_err());
+        assert!(!directory.exists());
+        assert!(healthy.requests.lock().unwrap().is_empty());
+        let lines = lines.lock().unwrap();
+        assert!(lines.iter().any(|s| s.contains("刷新被拒绝")));
+        assert!(lines.iter().any(|s| s.contains("检查失败")));
+        assert!(lines.iter().all(|s| !s.contains("hidden")));
+    }
+
+    #[test]
+    fn refreshed_identity_keeps_timeline_ranges_key_and_selected_track_attributes() {
+        let base = Url::parse("https://old.test/asset/index.m3u8").unwrap();
+        let text = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:8\n#EXT-X-KEY:METHOD=AES-128,URI=\"https://old.test/asset/key?sig=expired\",IV=0x9\n#EXTINF:2,\nhttps://old.test/asset/a.ts?sig=expired\n#EXT-X-ENDLIST";
+        let lines: Vec<_> = text.lines().map(String::from).collect();
+        let identity = media_identity(&lines, &base).unwrap();
+        let fresh: Vec<_> = text
+            .replace("old.test", "new.test")
+            .replace("expired", "fresh")
+            .lines()
+            .map(String::from)
+            .collect();
+        assert_eq!(identity, media_identity(&fresh, &base).unwrap());
+        for change in [
+            text.replace("SEQUENCE:8", "SEQUENCE:9"),
+            text.replace("IV=0x9", "IV=0x8"),
+            text.replace("EXTINF:2", "EXTINF:3"),
+            text.replace("/asset/", "/another/"),
+            text.replace("a.ts?sig=expired", "a.ts?video=another&sig=expired"),
+        ] {
+            assert_ne!(
+                identity,
+                media_identity(&change.lines().map(String::from).collect::<Vec<_>>(), &base)
+                    .unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires installed Edge/Chrome/Chromium; local browser/network regression"]
+    async fn real_browser_observes_dynamic_player_and_scopes_manifest_authentication() {
+        let fixture = server(|request| {
+            let path = request.lines().next().unwrap_or("");
+            if path.contains("/watch") {
+                let host = request
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':')
+                            .filter(|(k, _)| k.eq_ignore_ascii_case("host"))
+                            .map(|(_, v)| v.trim())
+                    })
+                    .unwrap();
+                let embed = format!("http://{}/player", host.replace("127.0.0.1", "localhost"));
+                (
+                    200,
+                    vec![("Content-Type".into(), "text/html".into())],
+                    format!("<title>Embedded fixture</title><iframe src='{embed}'></iframe>")
+                        .into_bytes(),
+                )
+            } else if path.contains("/player") {
+                let html = r#"<title>Dynamic HLS fixture</title><video></video><script>
+                setTimeout(async () => {
+                  const url = location.origin + '/asset/playlist?sig=fresh';
+                  const source = document.createElement('source'); source.type='application/vnd.apple.mpegurl'; source.src=url;
+                  document.querySelector('video').appendChild(source);
+                  await fetch(url, {headers:{'x-cdn-auth':'manifest-only'}});
+                  fetch('/asset/a.ts').catch(()=>{});
+                },200);
+                </script>"#;
+                (
+                    200,
+                    vec![("Content-Type".into(), "text/html".into())],
+                    html.as_bytes().to_vec(),
+                )
+            } else if path.contains("/asset/playlist") {
+                if !request
+                    .to_ascii_lowercase()
+                    .contains("x-cdn-auth: manifest-only")
+                {
+                    return (403, vec![], vec![]);
+                }
+                (
+                    200,
+                    vec![(
+                        "Content-Type".into(),
+                        "application/vnd.apple.mpegurl".into(),
+                    )],
+                    b"#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\na.ts\n#EXT-X-ENDLIST\n"
+                        .to_vec(),
+                )
+            } else if path.contains("/asset/a.ts") {
+                assert!(!request.to_ascii_lowercase().contains("x-cdn-auth"));
+                (200, vec![], ts())
+            } else {
+                (404, vec![], vec![])
+            }
+        });
+        let cfg = cfg(&format!("{}/watch", fixture.url));
+        let source = crate::hls_browser::resolve(&cfg, None, None, Arc::new(|_| {}))
+            .await
+            .unwrap();
+        assert!(source.url.ends_with("/asset/playlist?sig=fresh"));
+        assert!(!source.headers.contains_key("x-cdn-auth"));
+        assert_eq!(
+            source.request_headers[&source.url]["x-cdn-auth"],
+            "manifest-only"
+        );
+        let manifest = source
+            .browser
+            .as_ref()
+            .unwrap()
+            .get(
+                &Url::parse(&source.url).unwrap(),
+                &source.request_headers[&source.url],
+                None,
+                MANIFEST_LIMIT,
+                true,
+            )
+            .await
+            .unwrap()
+            .1;
+        assert!(manifest.starts_with(b"#EXTM3U"));
+        assert!(fixture
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|r| !r.starts_with("GET /asset/a.ts ")));
+        let ready = prepare_with_progress(
+            &cfg,
+            &source,
+            &[],
+            &temporary(),
+            None,
+            true,
+            None,
+            Arc::new(|_| {}),
+        )
+        .await
+        .unwrap();
+        assert!(ready.uses_local_service);
+        let resource = read(&ready)
+            .lines()
+            .find(|s| s.starts_with("http://127.0.0.1:"))
+            .unwrap()
+            .to_string();
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(resource)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.bytes().await.unwrap().as_ref(), ts().as_slice());
+        assert!(!ready.engine_headers.contains_key("x-cdn-auth"));
+        let expired = crate::m3u8::direct_source(&source.url.replace("sig=fresh", "sig=expired"));
+        let renewed = prepare_with_progress(
+            &cfg,
+            &expired,
+            &[],
+            &temporary(),
+            None,
+            true,
+            None,
+            Arc::new(|_| {}),
+        )
+        .await
+        .unwrap();
+        assert!(renewed.uses_local_service);
+        assert_eq!(renewed.playlist_switches, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "optional bounded remote player regression via TEST_REMOTE_PAGE; no media download"]
+    async fn real_remote_page_preflight_without_site_rules_or_user_mappings() {
+        let url = std::env::var("TEST_REMOTE_PAGE").unwrap();
+        let cfg = cfg(&url);
+        let progress: Progress = Arc::new(|s| println!("{s}"));
+        let engine = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("code")
+            .join(crate::locate::bin_name("yt-dlp"));
+        let output = tokio::time::timeout(
+            Duration::from_secs(60),
+            crate::no_window_cmd(&engine)
+                .args(crate::m3u8::resolver_args(&cfg, None))
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let source = if output.status.success() {
+            let info = crate::m3u8::parse_resolver_output(&output.stdout).unwrap();
+            println!("Production yt-dlp resolver selected a single HLS stream; testing native startup and browser recovery.");
+            crate::m3u8::source_from_info(&info)
+                .expect("single stream must use the production HLS routing path")
+        } else {
+            crate::hls_browser::resolve(&cfg, None, None, progress.clone())
+                .await
+                .unwrap()
+        };
+        let ready = prepare_with_progress(
+            &cfg,
+            &source,
+            &[],
+            &temporary(),
+            source.cookie_text.clone(),
+            true,
+            None,
+            progress,
+        )
+        .await
+        .unwrap();
+        assert!(ready.input.starts_with("file:"));
+        assert!(ready.plan.routes.is_empty());
+        assert!(ready.uses_local_service);
+        // A registered first fragment passes through the same bounded service used
+        // by RE. Ask only for a sample, never download the remote video.
+        let text = read(&ready);
+        let first = text
+            .lines()
+            .find(|s| s.starts_with("http://127.0.0.1:"))
+            .unwrap();
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(first)
+            .header("Range", "bytes=0-65535")
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        assert!(response.bytes().await.unwrap().len() <= SAMPLE_LIMIT);
+        println!("Remote player resolved and bounded segment/key validation passed without built-in rules or mappings.");
     }
     fn vod(host: &str) -> String {
         format!("#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:9\n#EXTINF:1,\n{host}/video/s0.ts?token=a%2Fb&z=2\n#EXT-X-DISCONTINUITY\n#EXTINF:1,\n{host}/video/s1.ts\n#EXTINF:1,\n{host}/video/s2.ts\n#EXT-X-ENDLIST\n")
@@ -1970,7 +2750,13 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("没有验证通过"));
-        assert_eq!(master.requests.lock().unwrap().len(), 1);
+        assert_eq!(master.requests.lock().unwrap().len(), 3);
+        assert!(master
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|r| r.starts_with("GET /index.m3u8 ")));
     }
 
     #[tokio::test]

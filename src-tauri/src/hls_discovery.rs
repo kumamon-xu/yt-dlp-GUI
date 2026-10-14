@@ -1,7 +1,7 @@
-//! Discover alternatives from provider declarations or bounded site adapters.
+//! Discover alternatives from provider declarations.
 //! Candidates are transient and must pass the regular VOD checks before use.
 
-use crate::hls_preflight::{attributes, http_url, MirrorRule, RequestContext};
+use crate::hls_preflight::{attributes, http_url, RequestContext};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -264,61 +264,10 @@ pub async fn from_master(ctx: &RequestContext, lines: &[String], base: &Url) -> 
     declared(lines, base, steering.as_ref())
 }
 
-/// This adapter is limited to the site's known root mirror and the current asset
-/// directory. Sharing a DNS suffix is never a generic reason to trust a mirror.
-pub fn site_rule(manifest: &Url, resource: &Url) -> Option<MirrorRule> {
-    let host = manifest.host_str()?;
-    let resource_host = resource.host_str()?;
-    let site_host = |h: &str| h == "javday.homes" || h.ends_with(".javday.homes");
-    let prefix = manifest.path().rsplit_once('/')?.0.to_string() + "/";
-    if manifest.scheme() != "https"
-        || resource.scheme() != "https"
-        || manifest.port_or_known_default() != Some(443)
-        || resource.port_or_known_default() != Some(443)
-        || !site_host(host)
-        || !site_host(resource_host)
-        || resource_host == "javday.homes"
-        || !prefix.starts_with("/videos/")
-        || prefix == "/videos/"
-        || !resource.path().starts_with(&prefix)
-    {
-        return None;
-    }
-    Some(MirrorRule {
-        from_origin: resource.origin().ascii_serialization(),
-        to_origin: "https://javday.homes".into(),
-        path_prefix: prefix,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn site_adapter_is_asset_scoped_and_does_not_guess_other_sites() {
-        let m = Url::parse("https://javday.homes/videos/id/quality/index.m3u8").unwrap();
-        let r = Url::parse("https://random.javday.homes/videos/id/quality/a.ts?sig=a%2Fb").unwrap();
-        let rule = site_rule(&m, &r).unwrap();
-        assert_eq!(
-            rule.candidate(&r).unwrap().as_str(),
-            "https://javday.homes/videos/id/quality/a.ts?sig=a%2Fb"
-        );
-        for raw in [
-            "https://javday.homes.evil.test/videos/id/quality/a.ts",
-            "https://random.javday.homes/videos/other/a.ts",
-            "http://random.javday.homes/videos/id/quality/a.ts",
-            "https://random.javday.homes:8443/videos/id/quality/a.ts",
-        ] {
-            assert!(site_rule(&m, &Url::parse(raw).unwrap()).is_none());
-        }
-        assert!(site_rule(
-            &Url::parse("https://unknown.test/videos/id/quality/index.m3u8").unwrap(),
-            &r
-        )
-        .is_none());
-    }
 
     #[test]
     fn declared_identity_preserves_codec_fps_and_audio_language() {

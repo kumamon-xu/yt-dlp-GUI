@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Plus, Search, Trash2, X } from "lucide-react";
+import { listen } from "@tauri-apps/api/event";
 import { analyzeHls, cancelHlsAnalysis, normalizeHlsMirrors, type GlobalSettings, type HlsAnalysis, type HlsSettings } from "../lib/ytdlp";
 import { useAppStore, useT } from "../store";
 
@@ -12,6 +13,8 @@ export default function HlsSettingsDialog({ settings, onClose, onSaved }: {
   const persist = useAppStore((s) => s.persistHlsSettings);
   const [preflight, setPreflight] = useState(settings.hlsPreflight ?? true);
   const [automatic, setAutomatic] = useState(settings.hlsAutoDiscovery ?? true);
+  const [browserPath, setBrowserPath] = useState(settings.hlsBrowserPath ?? "");
+  const [messages, setMessages] = useState<string[]>([]);
   const [rules, setRules] = useState(settings.hlsMirrors ?? []);
   const [filter, setFilter] = useState("");
   const [url, setUrl] = useState("");
@@ -21,10 +24,21 @@ export default function HlsSettingsDialog({ settings, onClose, onSaved }: {
   const [saving, setSaving] = useState(false);
   const session = useRef<string | null>(null);
   const dialog = useRef<HTMLDivElement>(null);
+  const output = useRef<HTMLDivElement>(null);
   const close = useRef(onClose);
   close.current = onClose;
 
   useEffect(() => {
+    if (!output.current) return;
+    output.current.scrollTop = output.current.scrollHeight;
+    output.current.scrollIntoView({ block: "nearest" });
+  }, [messages, report, error]);
+
+  useEffect(() => {
+    let disposed = false;
+    const subscription = listen<{ id: string; line: string }>("hls_analysis_log", ({ payload }) => {
+      if (!disposed && payload.id === session.current) setMessages((lines) => [...lines.slice(-199), payload.line]);
+    }).catch(() => () => {});
     const previous = document.activeElement as HTMLElement | null;
     dialog.current?.focus();
     const handleKey = (e: KeyboardEvent) => {
@@ -37,6 +51,8 @@ export default function HlsSettingsDialog({ settings, onClose, onSaved }: {
     };
     document.addEventListener("keydown", handleKey);
     return () => {
+      disposed = true;
+      void subscription.then((unlisten) => unlisten()).catch(() => {});
       document.removeEventListener("keydown", handleKey);
       if (session.current) void cancelHlsAnalysis(session.current).catch(() => {});
       session.current = null;
@@ -45,7 +61,7 @@ export default function HlsSettingsDialog({ settings, onClose, onSaved }: {
   }, []);
 
   const field = "w-full min-w-0 rounded-md border border-slate-700 bg-slate-900 px-2 py-1.5 text-xs text-slate-200";
-  const values = (): HlsSettings => ({ hlsPreflight: preflight, hlsAutoDiscovery: automatic, hlsMirrors: normalizeHlsMirrors(rules) });
+  const values = (): HlsSettings => ({ hlsPreflight: preflight, hlsAutoDiscovery: automatic, hlsBrowserPath: browserPath.trim() || null, hlsMirrors: normalizeHlsMirrors(rules) });
   const filtered = rules.map((rule, index) => ({ rule, index })).filter(({ rule }) =>
     `${rule.fromOrigin} ${rule.toOrigin} ${rule.pathPrefix}`.toLowerCase().includes(filter.toLowerCase()));
 
@@ -61,6 +77,9 @@ export default function HlsSettingsDialog({ settings, onClose, onSaved }: {
           <label className="flex items-center gap-2 text-xs"><input type="checkbox" disabled={busy || saving} checked={preflight} onChange={(e) => { setPreflight(e.target.checked); setReport(null); }} />{t("settings.hlsPreflight")}</label>
           <label className="flex items-center gap-2 text-xs"><input type="checkbox" disabled={busy || saving} checked={automatic} onChange={(e) => { setAutomatic(e.target.checked); setReport(null); }} />{t("settings.hlsAutomatic")}</label>
           <p className="text-[11px] leading-relaxed text-slate-400">{t("settings.hlsAutomaticHint")}</p>
+          <label className="block space-y-1 text-[11px] text-slate-400">{t("settings.hlsBrowserPath")}
+            <input className={field} disabled={busy || saving} value={browserPath} placeholder={t("settings.hlsBrowserHint")} onChange={(e) => setBrowserPath(e.target.value)} />
+          </label>
           {!preflight && <p className="text-[11px] text-amber-300">{t("settings.hlsDisabledHint")}</p>}
         </div>
         <div className="space-y-2">
@@ -97,7 +116,7 @@ export default function HlsSettingsDialog({ settings, onClose, onSaved }: {
             <button disabled={busy || saving || !/^https?:\/\//i.test(url.trim())} className="flex shrink-0 items-center gap-1 rounded bg-sky-600 px-3 text-xs disabled:opacity-40"
               onClick={async () => {
                 const id = crypto.randomUUID(); session.current = id;
-                setBusy(true); setError(""); setReport(null);
+                setBusy(true); setError(""); setReport(null); setMessages([]);
                 try { const result = await analyzeHls(id, url.trim(), { ...settings, ...values() }); if (session.current === id) setReport(result); }
                 catch (e) { if (session.current === id) setError(String(e)); }
                 finally { if (session.current === id) { session.current = null; setBusy(false); } }
@@ -107,9 +126,9 @@ export default function HlsSettingsDialog({ settings, onClose, onSaved }: {
             const id = session.current; session.current = null; setBusy(false);
             if (id) void cancelHlsAnalysis(id).catch(() => {});
           }}>{t("action.cancel")}</button>}
-          {report && <div role="status" className="max-h-36 space-y-1 overflow-y-auto text-[11px] text-emerald-300">
-            {report.messages.map((message, i) => <p key={i}>{message}</p>)}
-            <p className="text-slate-400">{t("settings.hlsDomains")}: {report.domains.join(" · ")}</p>
+          {(messages.length > 0 || report) && <div ref={output} role="status" className="max-h-36 space-y-1 overflow-y-auto text-[11px] text-slate-300">
+            {(messages.length ? messages : report?.messages ?? []).map((message, i) => <p key={i}>{message}</p>)}
+            {report && <p className="text-slate-400">{t("settings.hlsDomains")}: {report.domains.join(" · ")}</p>}
           </div>}
         </div>
         {error && <p role="alert" className="text-xs text-red-400">{error}</p>}

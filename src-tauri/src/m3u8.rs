@@ -15,6 +15,9 @@ pub struct HlsSource {
     pub resolved: bool,
     pub cookie_text: Option<String>,
     pub manifest_url: Option<String>,
+    // Exact request scopes observed in the player, never persisted or logged.
+    pub request_headers: BTreeMap<String, BTreeMap<String, String>>,
+    pub browser: Option<std::sync::Arc<crate::hls_browser::Transport>>,
 }
 
 pub fn is_m3u8_url(url: &str) -> bool {
@@ -52,6 +55,8 @@ pub fn direct_source(url: &str) -> HlsSource {
         resolved: false,
         cookie_text: None,
         manifest_url: None,
+        request_headers: BTreeMap::new(),
+        browser: None,
     }
 }
 
@@ -208,6 +213,8 @@ pub fn source_from_info(v: &Value) -> Option<HlsSource> {
         resolved: true,
         cookie_text: None,
         manifest_url: video["manifest_url"].as_str().map(String::from),
+        request_headers: BTreeMap::new(),
+        browser: None,
     })
 }
 
@@ -311,6 +318,11 @@ pub fn build_args(
         "--disable-update-check".into(),
         "--ui-language".into(),
         "en-US".into(),
+        // Intermittent TLS failures need more than RE's default three retries.
+        "--download-retry-count".into(),
+        "10".into(),
+        "--http-request-timeout".into(),
+        "60".into(),
         "--thread-count".into(),
         cfg.concurrent_fragments.to_string(),
         "--save-dir".into(),

@@ -1,7 +1,7 @@
 //! 任务管理：并发队列、generation 所有权、杀进程树、进度事件
 
 use crate::command::{
-    apply_kind_constraints, apply_settings, build_args, needs_ffmpeg, NewTask, ProxySource,
+    apply_kind_constraints, apply_settings, build_args, needs_ffmpeg, NewTask, Preset, ProxySource,
     TaskKind,
 };
 use crate::parser::{classify_error, parse_progress, FILE_PREFIX};
@@ -785,7 +785,25 @@ async fn spawn_download(app: AppHandle, inner: Arc<TaskInner>, gen: u64) -> Resu
             Some(crate::m3u8::direct_source(&request.url))
         } else {
             let engine = find_engine(settings.engine_path.as_deref())?;
-            match resolve_task_source(&app, &inner, gen, &engine, &cfg_preview).await {
+            let resolve = resolve_task_source(
+                &app,
+                &inner,
+                gen,
+                &engine,
+                &cfg_preview,
+                &settings,
+                task_progress(&app, &inner, gen),
+            );
+            tokio::pin!(resolve);
+            let result = loop {
+                tokio::select! {
+                    result = &mut resolve => break result,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                        if !still_starting(&inner,gen) { return Err("任务已取消或暂停".into()); }
+                    }
+                }
+            };
+            match result {
                 Ok(source) => source,
                 Err(e) if still_starting(&inner, gen) => {
                     let id = inner.payload.lock().unwrap().id.clone();
@@ -835,28 +853,31 @@ async fn spawn_download(app: AppHandle, inner: Arc<TaskInner>, gen: u64) -> Resu
                 .headers
                 .insert("User-Agent".into(), "Mozilla/5.0".into());
         }
-        if !source
-            .headers
-            .keys()
-            .any(|k| k.eq_ignore_ascii_case("referer"))
+        if source.request_headers.is_empty()
+            && !source
+                .headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("referer"))
         {
             source
                 .headers
                 .insert("Referer".into(), cfg_preview.url.clone());
         }
-        let prepared = if settings.hls_preflight {
+        let prepared = if settings.hls_preflight || source.browser.is_some() {
             let _ = app.emit(
                 "task_log",
                 serde_json::json!({"id":id,"line":"正在检查 HLS 点播分片和可信备用地址…"}),
             );
             let preflight_dir = tmp.join(format!("preflight-{gen}"));
-            let check = crate::hls_preflight::prepare_with_discovery(
+            let check = crate::hls_preflight::prepare_with_progress(
                 &cfg_preview,
                 &source,
                 &settings.hls_mirrors,
                 &preflight_dir,
                 source.cookie_text.clone(),
                 settings.hls_auto_discovery,
+                settings.hls_browser_path.as_deref(),
+                task_progress(&app, &inner, gen),
             );
             tokio::pin!(check);
             let result = loop {
@@ -868,9 +889,6 @@ async fn spawn_download(app: AppHandle, inner: Arc<TaskInner>, gen: u64) -> Resu
                 }
             };
             let prepared = result?;
-            for message in &prepared.messages {
-                let _ = app.emit("task_log", serde_json::json!({"id":id,"line":message}));
-            }
             if !prepared.plan.routes.is_empty() {
                 let _ = app.emit("task_log", serde_json::json!({"id":id,"line":format!("已应用 {} 条验证通过的备用映射",prepared.plan.routes.len())}));
             }
@@ -881,7 +899,14 @@ async fn spawn_download(app: AppHandle, inner: Arc<TaskInner>, gen: u64) -> Resu
         if !still_starting(&inner, gen) {
             return Err("任务已取消或暂停".into());
         }
-        let mut args = crate::m3u8::build_args(&cfg_preview, &source, &base, &tmp)?;
+        if let Some(prepared) = &prepared {
+            source.headers = prepared.engine_headers.clone();
+        }
+        let mut engine_cfg = cfg_preview.clone();
+        if prepared.as_ref().is_some_and(|p| p.uses_local_service) {
+            engine_cfg.proxy = None;
+        }
+        let mut args = crate::m3u8::build_args(&engine_cfg, &source, &base, &tmp)?;
         if let Some(prepared) = &prepared {
             args[0] = prepared.input.clone();
         }
@@ -913,6 +938,31 @@ fn still_starting(inner: &TaskInner, gen: u64) -> bool {
     inner.run_generation.load(Ordering::SeqCst) == gen
         && !inner.canceled.load(Ordering::SeqCst)
         && inner.payload.lock().unwrap().status == TaskStatus::Starting
+}
+
+fn task_progress(
+    app: &AppHandle,
+    inner: &Arc<TaskInner>,
+    gen: u64,
+) -> crate::hls_preflight::Progress {
+    let app = app.clone();
+    let inner = inner.clone();
+    Arc::new(move |line| {
+        if inner.run_generation.load(Ordering::SeqCst) == gen
+            && !inner.canceled.load(Ordering::SeqCst)
+        {
+            let p = inner.payload.lock().unwrap();
+            if !matches!(
+                p.status,
+                TaskStatus::Starting | TaskStatus::Downloading | TaskStatus::Postprocess
+            ) {
+                return;
+            }
+            let id = p.id.clone();
+            drop(p);
+            let _ = app.emit("task_log", serde_json::json!({"id":id,"line":line}));
+        }
+    })
 }
 
 #[derive(Serialize)]
@@ -1005,6 +1055,14 @@ pub async fn analyze_hls(
     }
     let _guard = AnalysisGuard(id.clone());
     let cfg = task.to_config();
+    let progress_app = app.clone();
+    let progress_id = id.clone();
+    let progress: crate::hls_preflight::Progress = Arc::new(move |line| {
+        let _ = progress_app.emit(
+            "hls_analysis_log",
+            serde_json::json!({"id":progress_id,"line":line}),
+        );
+    });
     let future = async {
         let mut source = if crate::m3u8::direct_auto(&cfg)
             && cfg.cookies_browser.as_ref().is_none_or(|s| s.is_empty())
@@ -1012,7 +1070,7 @@ pub async fn analyze_hls(
             crate::m3u8::direct_source(&cfg.url)
         } else {
             let engine = find_engine(settings.engine_path.as_deref())?;
-            resolve_task_source(&app, &inner, 1, &engine, &cfg)
+            resolve_task_source(&app, &inner, 1, &engine, &cfg, &settings, progress.clone())
                 .await?
                 .ok_or("此页面未解析出可准确映射的单一 HLS 流；多轨或后处理任务继续使用 yt-dlp")?
         };
@@ -1028,23 +1086,26 @@ pub async fn analyze_hls(
                 .headers
                 .insert("User-Agent".into(), "Mozilla/5.0".into());
         }
-        if !source
-            .headers
-            .keys()
-            .any(|k| k.eq_ignore_ascii_case("referer"))
+        if source.request_headers.is_empty()
+            && !source
+                .headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("referer"))
         {
             source.headers.insert("Referer".into(), cfg.url.clone());
         }
         let directory = crate::config::config_dir(&app)?
             .join("hls-analysis")
             .join(&id);
-        let prepared = crate::hls_preflight::prepare_with_discovery(
+        let prepared = crate::hls_preflight::prepare_with_progress(
             &cfg,
             &source,
             &settings.hls_mirrors,
             &directory,
             source.cookie_text.clone(),
             settings.hls_auto_discovery,
+            settings.hls_browser_path.as_deref(),
+            progress.clone(),
         )
         .await?;
         Ok(HlsAnalysis {
@@ -1087,7 +1148,11 @@ fn unique_hls_base(base: std::path::PathBuf, format: &str, id: &str) -> std::pat
 }
 
 fn add_cookie_header(source: &mut crate::m3u8::HlsSource, file: &str) -> Result<(), String> {
-    let text = std::fs::read_to_string(file).map_err(|e| format!("无法读取 Cookies 文件：{e}"))?;
+    let text = if source.browser.is_some() && source.cookie_text.is_some() {
+        source.cookie_text.clone().unwrap()
+    } else {
+        std::fs::read_to_string(file).map_err(|e| format!("无法读取 Cookies 文件：{e}"))?
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1110,12 +1175,52 @@ impl Drop for ExportedCookies {
     }
 }
 
+fn browser_fallback_allowed(
+    cfg: &crate::command::TaskConfig,
+    settings: &crate::GlobalSettings,
+) -> bool {
+    settings.hls_auto_discovery
+        && !matches!(cfg.preset, Preset::Custom(_))
+        && crate::m3u8::eligible(cfg)
+        && !crate::m3u8::is_m3u8_url(&cfg.url)
+}
+
+async fn resolve_browser_source(
+    cfg: &crate::command::TaskConfig,
+    settings: &crate::GlobalSettings,
+    progress: crate::hls_preflight::Progress,
+    exported: Option<&Path>,
+) -> Result<Option<crate::m3u8::HlsSource>, String> {
+    progress("HLS 预解析未取得视频，尝试浏览器观察当前播放器");
+    let mut browser_cfg = cfg.clone();
+    if let Some(file) = exported.filter(|f| f.is_file()) {
+        browser_cfg.cookies_file = Some(file.to_string_lossy().into());
+    }
+    let mut source = crate::hls_browser::resolve(
+        &browser_cfg,
+        None,
+        settings.hls_browser_path.as_deref(),
+        progress,
+    )
+    .await?;
+    if let Some(file) = browser_cfg
+        .cookies_file
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        add_cookie_header(&mut source, file)?;
+    }
+    Ok(Some(source))
+}
+
 async fn resolve_task_source(
     app: &AppHandle,
     inner: &TaskInner,
     gen: u64,
     engine: &Path,
     cfg: &crate::command::TaskConfig,
+    settings: &crate::GlobalSettings,
+    progress: crate::hls_preflight::Progress,
 ) -> Result<Option<crate::m3u8::HlsSource>, String> {
     let exported = if cfg.cookies_file.as_ref().is_none_or(|s| s.is_empty())
         && cfg.cookies_browser.as_ref().is_some_and(|s| !s.is_empty())
@@ -1165,6 +1270,15 @@ async fn resolve_task_source(
         Ok(result) => result.map_err(|e| e.to_string())?,
         Err(_) => {
             kill_process_tree_grace(pid, std::time::Duration::ZERO);
+            if browser_fallback_allowed(cfg, settings) {
+                return resolve_browser_source(
+                    cfg,
+                    settings,
+                    progress,
+                    exported.as_ref().map(|f| f.0.as_path()),
+                )
+                .await;
+            }
             return Err("视频解析超时（60s）".into());
         }
     };
@@ -1176,6 +1290,15 @@ async fn resolve_task_source(
         }
     }
     if !out.status.success() {
+        if browser_fallback_allowed(cfg, settings) {
+            return resolve_browser_source(
+                cfg,
+                settings,
+                progress,
+                exported.as_ref().map(|f| f.0.as_path()),
+            )
+            .await;
+        }
         return Err(crate::parser::friendly_error(&String::from_utf8_lossy(
             &out.stderr,
         )));
@@ -1311,6 +1434,10 @@ fn pump_queue(app: AppHandle) {
                         && p.status == TaskStatus::Starting
                     {
                         p.status = TaskStatus::Failed;
+                        let _ = app.emit(
+                            "task_log",
+                            serde_json::json!({"id":p.id,"line":format!("任务启动失败：{e}")}),
+                        );
                         p.error = Some(e);
                         p.error_code = Some("PROCESS_FAILED".into());
                     }
@@ -2576,7 +2703,7 @@ fn main() {{
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let cases = [
+        let mut cases = vec![
             (
                 "master.m3u8?token=demo",
                 crate::command::Preset::Limit720,
@@ -2622,6 +2749,27 @@ fn main() {{
                 false,
             ),
         ];
+        let browser_path = std::env::var("TEST_HLS_BROWSER_PATH").ok();
+        if browser_path.is_some() {
+            cases.push((
+                "dynamic-watch.html",
+                crate::command::Preset::Best,
+                true,
+                false,
+            ));
+            cases.push((
+                "dynamic-watch.html?range=1",
+                crate::command::Preset::Best,
+                true,
+                false,
+            ));
+            cases.push((
+                "dynamic-watch.html?encrypted=1",
+                crate::command::Preset::Best,
+                true,
+                true,
+            ));
+        }
         for (index, (suffix, preset, expect_video, expect_audio)) in cases.into_iter().enumerate() {
             let url = format!("{host}/{suffix}");
             let cfg = crate::command::TaskConfig {
@@ -2635,7 +2783,18 @@ fn main() {{
                 preset,
                 ..Default::default()
             };
-            let mut source = if crate::m3u8::direct_auto(&cfg) {
+            let mut source = if index >= 9 {
+                Some(
+                    crate::hls_browser::resolve(
+                        &cfg,
+                        None,
+                        browser_path.as_deref(),
+                        Arc::new(|_| {}),
+                    )
+                    .await
+                    .unwrap(),
+                )
+            } else if crate::m3u8::direct_auto(&cfg) {
                 let mut s = crate::m3u8::direct_source(&url);
                 s.headers
                     .insert("Referer".into(), format!("{host}/watch.html"));
@@ -2701,9 +2860,31 @@ fn main() {{
                 if matches!(index, 5 | 6) {
                     assert!(!checked.plan.routes.is_empty());
                 }
-                if index >= 7 {
+                if matches!(index, 7 | 8) {
                     assert_eq!(checked.playlist_switches, 1);
                 }
+                if index >= 9 {
+                    assert!(checked.uses_local_service);
+                    assert!(!source.request_headers[&source.url].is_empty());
+                    // Explicit Chromium read verifies the network path even though
+                    // the local fixture's native TLS-free transport also works.
+                    let sample = source
+                        .browser
+                        .as_ref()
+                        .unwrap()
+                        .get(
+                            &url::Url::parse(&format!("{host}/video0.ts")).unwrap(),
+                            &Default::default(),
+                            None,
+                            65536,
+                            false,
+                        )
+                        .await
+                        .unwrap()
+                        .1;
+                    assert!(!sample.is_empty());
+                }
+                source.headers = checked.engine_headers.clone();
                 let mut args =
                     crate::m3u8::build_args(&cfg, source, &base, &dir.join(format!("tmp-{index}")))
                         .unwrap();

@@ -95,6 +95,9 @@ queue.json
 /playwright-report/
 /test-results/
 /output/playwright/
+browser-profiles/
+ytdlp-hls-browser-*/
+DevToolsActivePort
 
 # Downloaded media and HLS work files (not source assets)
 /downloads/

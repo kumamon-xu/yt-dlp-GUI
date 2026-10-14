@@ -40,6 +40,8 @@ pub struct GlobalSettings {
     #[serde(default = "default_use_m3u8dl")]
     pub hls_auto_discovery: bool,
     #[serde(default)]
+    pub hls_browser_path: Option<String>,
+    #[serde(default)]
     pub hls_mirrors: Vec<crate::hls_preflight::MirrorRule>,
     #[serde(default = "default_merge")]
     pub merge_format: String,
@@ -82,6 +84,7 @@ impl Default for GlobalSettings {
             use_m3u8dl: true,
             hls_preflight: true,
             hls_auto_discovery: true,
+            hls_browser_path: None,
             hls_mirrors: Vec::new(),
             merge_format: default_merge(),
         }

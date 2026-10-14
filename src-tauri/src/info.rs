@@ -7,6 +7,10 @@ use serde::Serialize;
 use serde_json::Value;
 use std::process::Stdio;
 use std::sync::OnceLock;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tauri::{AppHandle, Manager};
 use tokio::process::Child;
@@ -181,6 +185,96 @@ fn preview_slot() -> &'static Mutex<Option<u32>> {
     static SLOT: OnceLock<Mutex<Option<u32>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(None))
 }
+static PREVIEW_GENERATION: AtomicU64 = AtomicU64::new(0);
+struct PreviewCookies(std::path::PathBuf);
+impl Drop for PreviewCookies {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+impl PreviewCookies {
+    fn new(generation: u64) -> Result<Self, String> {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!(
+            "cookies-preview-{}-{generation}-{}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let guard = Self(path);
+        options
+            .open(&guard.0)
+            .map_err(|_| "无法创建预览 Cookies 导出文件")?
+            .write_all(b"# Netscape HTTP Cookie File\n")
+            .map_err(|_| "无法初始化预览 Cookies 文件")?;
+        Ok(guard)
+    }
+}
+
+fn hls_info(source: crate::m3u8::HlsSource, url: String) -> VideoInfo {
+    VideoInfo {
+        id: source.title.clone(),
+        title: source.title,
+        thumbnail: None,
+        duration: None,
+        uploader: None,
+        description: Some("HLS/m3u8 · N_m3u8DL-RE".into()),
+        webpage_url: Some(url),
+        is_playlist: false,
+        formats: Vec::new(),
+        playlist: None,
+        playlist_title: None,
+        playlist_count: None,
+    }
+}
+
+async fn browser_preview(
+    url: &str,
+    settings: &crate::GlobalSettings,
+    generation: u64,
+    exported: Option<&std::path::Path>,
+) -> Result<VideoInfo, String> {
+    let cfg = crate::command::TaskConfig {
+        url: url.into(),
+        no_playlist: true,
+        cookies_file: settings
+            .cookies_file
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                exported
+                    .filter(|p| p.is_file())
+                    .map(|p| p.to_string_lossy().into())
+            }),
+        cookies_browser: settings.cookies_browser.clone(),
+        proxy: settings.proxy.clone(),
+        ..Default::default()
+    };
+    let future = crate::hls_browser::resolve(
+        &cfg,
+        None,
+        settings.hls_browser_path.as_deref(),
+        Arc::new(|_| {}),
+    );
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            result = &mut future => return result.map(|s| hls_info(s,url.into())),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                if PREVIEW_GENERATION.load(Ordering::SeqCst) != generation { return Err("预览已被新请求替换".into()); }
+            }
+        }
+    }
+}
 
 #[tauri::command]
 pub async fn get_info(
@@ -190,6 +284,7 @@ pub async fn get_info(
     flat: Option<bool>,
 ) -> Result<VideoInfo, String> {
     use crate::{find_engine, js_runtime_arg, kill_process_tree, no_window_cmd};
+    let generation = PREVIEW_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
 
     let settings = app
         .state::<AppState>()
@@ -207,27 +302,26 @@ pub async fn get_info(
     // need a successful yt-dlp preview (or even an installed yt-dlp executable).
     if settings.use_m3u8dl && crate::m3u8::is_m3u8_url(&url) {
         let source = crate::m3u8::direct_source(&url);
-        return Ok(VideoInfo {
-            id: source.title.clone(),
-            title: source.title,
-            thumbnail: None,
-            duration: None,
-            uploader: None,
-            description: Some("HLS/m3u8 · N_m3u8DL-RE".into()),
-            webpage_url: Some(url),
-            is_playlist: false,
-            formats: Vec::new(),
-            playlist: None,
-            playlist_title: None,
-            playlist_count: None,
-        });
+        return Ok(hls_info(source, url));
     }
 
     let engine_override =
         resolve_engine_override(engine_path.as_deref(), settings.engine_path.as_deref());
     let engine = find_engine(engine_override.as_deref())?;
+    let exported = if settings.use_m3u8dl
+        && settings.hls_auto_discovery
+        && settings
+            .cookies_browser
+            .as_ref()
+            .is_some_and(|s| !s.is_empty())
+        && settings.cookies_file.as_ref().is_none_or(|s| s.is_empty())
+    {
+        Some(PreviewCookies::new(generation)?)
+    } else {
+        None
+    };
     let use_flat = flat.unwrap_or(true);
-    let args = if use_flat {
+    let mut args = if use_flat {
         build_preview_args_flat(
             &url,
             settings.cookies_file.as_deref(),
@@ -244,6 +338,14 @@ pub async fn get_info(
             js_runtime_arg().as_deref(),
         )
     };
+    if let Some(file) = &exported {
+        args.pop();
+        args.extend([
+            "--cookies".into(),
+            file.0.to_string_lossy().into(),
+            url.clone(),
+        ]);
+    }
 
     let mut cmd = no_window_cmd(&engine);
     cmd.args(&args)
@@ -274,6 +376,18 @@ pub async fn get_info(
                 kill_process_tree(p);
             }
             let secs = timeout.as_secs();
+            if settings.use_m3u8dl
+                && settings.hls_auto_discovery
+                && PREVIEW_GENERATION.load(Ordering::SeqCst) == generation
+            {
+                return browser_preview(
+                    &url,
+                    &settings,
+                    generation,
+                    exported.as_ref().map(|f| f.0.as_path()),
+                )
+                .await;
+            }
             return Err(format!(
                 "解析超时（{secs}s）：链接可能无效，或需要网络/代理/Cookies"
             ));
@@ -283,6 +397,18 @@ pub async fn get_info(
     };
 
     if !out.status.success() {
+        if settings.use_m3u8dl
+            && settings.hls_auto_discovery
+            && PREVIEW_GENERATION.load(Ordering::SeqCst) == generation
+        {
+            return browser_preview(
+                &url,
+                &settings,
+                generation,
+                exported.as_ref().map(|f| f.0.as_path()),
+            )
+            .await;
+        }
         return Err(friendly_error(&String::from_utf8_lossy(&out.stderr)));
     }
     const PREVIEW_MAX_STDOUT: usize = 8 * 1024 * 1024;

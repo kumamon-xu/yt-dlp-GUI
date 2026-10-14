@@ -151,6 +151,7 @@ export interface GlobalSettings {
   useM3u8dl?: boolean;
   hlsPreflight?: boolean;
   hlsAutoDiscovery?: boolean;
+  hlsBrowserPath?: string | null;
   hlsMirrors?: HlsMirrorRule[];
   mergeFormat: string;
 }
@@ -168,7 +169,7 @@ export const buildCommand = (task: NewTask) => invoke<string>("build_command", {
 export const loadSettings = () => invoke<GlobalSettings>("load_settings");
 export const saveSettings = (settings: GlobalSettings) => invoke<void>("save_settings", { settings });
 
-export type HlsSettings = Pick<GlobalSettings, "hlsPreflight" | "hlsAutoDiscovery" | "hlsMirrors">;
+export type HlsSettings = Pick<GlobalSettings, "hlsPreflight" | "hlsAutoDiscovery" | "hlsBrowserPath" | "hlsMirrors">;
 export interface HlsAnalysis {
   messages: string[];
   domains: string[];
