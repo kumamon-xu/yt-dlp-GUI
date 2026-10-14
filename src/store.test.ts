@@ -66,6 +66,15 @@ describe("session presets and preview downloads", () => {
 });
 
 describe("settings and shared options", () => {
+  it("retains trusted HLS mappings across ordinary options autosaves", async () => {
+    const hlsMirrors = [{ fromOrigin: "https://cdn.test", toOrigin: "https://backup.test", pathPrefix: "/video/" }];
+    await useAppStore.getState().persistSettings({ ...settings(), hlsPreflight: true, hlsMirrors });
+    useAppStore.getState().setOptions({ preset: "720p", concurrentFragments: 8 });
+    await vi.advanceTimersByTimeAsync(401);
+    expect(vi.mocked(saveSettings).mock.lastCall?.[0]).toMatchObject({ hlsPreflight: true, hlsMirrors });
+    expect(useAppStore.getState().settings?.hlsMirrors).toEqual(hlsMirrors);
+    expect(useAppStore.getState().options.preset).toBe("720p");
+  });
   it("uses the new settings directory and retains it in later autosaves", async () => {
     useAppStore.getState().setOptions({ preset: "720p" });
     const next = { ...settings(), outDir: "D:/new", outTemplate: "%(id)s.%(ext)s",

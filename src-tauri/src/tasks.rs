@@ -571,6 +571,7 @@ pub fn spawn_download_with(
 struct HlsRun {
     output_base: std::path::PathBuf,
     format: String,
+    _prepared: Option<crate::hls_preflight::PreparedInput>,
 }
 
 fn spawn_process(
@@ -649,6 +650,7 @@ fn spawn_process(
                 p.error_code = None;
                 p.download_engine = Some(if hls.is_some() { "m3u8dl" } else { "ytDlp" }.into());
                 p.progress = None;
+                inner.stderr_tail.lock().unwrap().clear();
                 None
             }
         }
@@ -821,7 +823,64 @@ async fn spawn_download(app: AppHandle, inner: Arc<TaskInner>, gen: u64) -> Resu
         let tmp = Path::new(&cfg_preview.out_dir)
             .join(".m3u8dl")
             .join(safe_id);
-        let args = crate::m3u8::build_args(&cfg_preview, &source, &base, &tmp)?;
+        if !source
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("user-agent"))
+        {
+            source
+                .headers
+                .insert("User-Agent".into(), "Mozilla/5.0".into());
+        }
+        if !source
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("referer"))
+        {
+            source
+                .headers
+                .insert("Referer".into(), cfg_preview.url.clone());
+        }
+        let prepared = if settings.hls_preflight {
+            let _ = app.emit(
+                "task_log",
+                serde_json::json!({"id":id,"line":"正在检查 HLS 点播分片和可信备用地址…"}),
+            );
+            let preflight_dir = tmp.join(format!("preflight-{gen}"));
+            let check = crate::hls_preflight::prepare(
+                &cfg_preview,
+                &source,
+                &settings.hls_mirrors,
+                &preflight_dir,
+                source.cookie_text.clone(),
+            );
+            tokio::pin!(check);
+            let result = loop {
+                tokio::select! {
+                    result = &mut check => break result,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                        if !still_starting(&inner, gen) { return Err("任务已取消或暂停".into()); }
+                    }
+                }
+            };
+            let prepared = result?;
+            for message in &prepared.messages {
+                let _ = app.emit("task_log", serde_json::json!({"id":id,"line":message}));
+            }
+            if !prepared.plan.routes.is_empty() {
+                let _ = app.emit("task_log", serde_json::json!({"id":id,"line":format!("已应用 {} 条验证通过的备用映射",prepared.plan.routes.len())}));
+            }
+            Some(prepared)
+        } else {
+            None
+        };
+        if !still_starting(&inner, gen) {
+            return Err("任务已取消或暂停".into());
+        }
+        let mut args = crate::m3u8::build_args(&cfg_preview, &source, &base, &tmp)?;
+        if let Some(prepared) = &prepared {
+            args[0] = prepared.input.clone();
+        }
         {
             let mut p = inner.payload.lock().unwrap();
             p.title = Some(source.title);
@@ -836,6 +895,7 @@ async fn spawn_download(app: AppHandle, inner: Arc<TaskInner>, gen: u64) -> Resu
             Some(HlsRun {
                 output_base: base,
                 format,
+                _prepared: prepared,
             }),
         )
     } else {
@@ -879,6 +939,7 @@ fn add_cookie_header(source: &mut crate::m3u8::HlsSource, file: &str) -> Result<
         .unwrap_or_default()
         .as_secs();
     let cookies = crate::m3u8::cookie_header(&text, &source.url, now);
+    source.cookie_text = Some(text);
     if !cookies.is_empty() {
         source
             .headers
@@ -1024,7 +1085,8 @@ fn hls_line(raw: &str, app: &Option<AppHandle>, inner: &TaskInner, gen: u64) {
     if !p.status.is_running_download() {
         return;
     }
-    if let Some(percent) = crate::m3u8::progress(line) {
+    let percent = crate::m3u8::progress(line);
+    if let Some(percent) = percent {
         p.progress = Some(percent);
     }
     if line.contains("Merging") || line.contains("Muxing") {
@@ -1033,13 +1095,20 @@ fn hls_line(raw: &str, app: &Option<AppHandle>, inner: &TaskInner, gen: u64) {
     let id = p.id.clone();
     let has_progress = p.progress.is_some();
     drop(p);
-    // RE writes failures to stdout too; keep both streams for error classification.
-    let mut tail = inner.stderr_tail.lock().unwrap();
-    tail.push_back(crate::redact::redact_userinfo(line));
-    if tail.len() > 20 {
-        tail.pop_front();
+    // RE writes failures to stdout too. Repeated progress and exception frames
+    // must not evict the underlying warning before exit classification.
+    let lower = line.to_ascii_lowercase();
+    let diagnostic = lower.contains("warn :")
+        || lower.contains("error :")
+        || lower.contains("unhandled exception:");
+    let stack_frame = line.starts_with("at ") || line.starts_with("--- End of stack trace");
+    if diagnostic || (percent.is_none() && !stack_frame) {
+        let mut tail = inner.stderr_tail.lock().unwrap();
+        tail.push_back(crate::redact::redact_userinfo(line));
+        if tail.len() > 20 {
+            tail.pop_front();
+        }
     }
-    drop(tail);
     if let Some(app) = app {
         if has_progress {
             emit_payload(app, inner);
@@ -1735,8 +1804,12 @@ fn main() {{
         inner.payload.lock().unwrap().status = TaskStatus::Starting;
         spawn_download_with(Arc::clone(&inner), &slow, None, None).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        inner.stderr_tail.lock().unwrap().push_back(
+            "WARN : The SSL connection could not be established, see inner exception.".into(),
+        );
         inner.payload.lock().unwrap().status = TaskStatus::Starting;
         spawn_download_with(Arc::clone(&inner), &fast, None, None).unwrap();
+        assert!(inner.stderr_tail.lock().unwrap().is_empty());
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
         let p = inner.payload.lock().unwrap().clone();
         assert_ne!(
@@ -2272,6 +2345,41 @@ fn main() {{
     }
 
     #[tokio::test]
+    async fn hls_tls_warning_survives_progress_and_long_exception_stacks() {
+        let inner = make_inner("hls-tls", "https://test/index.m3u8");
+        inner.payload.lock().unwrap().status = TaskStatus::Downloading;
+        inner.run_generation.store(1, Ordering::SeqCst);
+        let mut data = String::from(
+            "09:28:00 WARN : The SSL connection could not be established, see inner exception.\r",
+        );
+        for _ in 0..50 {
+            data.push_str("Vid Kbps 0/63 0.00% -0.00Bps --:--:--\r");
+        }
+        data.push_str("Unhandled exception: System.Exception: Download first segment failed!\n");
+        for _ in 0..50 {
+            data.push_str("   at InvocationPipeline.InvokeAsync()\n--- End of stack trace from previous location ---\n");
+        }
+        read_hls_output(data.as_bytes(), None, Arc::clone(&inner), 1).await;
+        assert!(apply_child_exit(&inner, 1, false));
+        let payload = inner.payload.lock().unwrap();
+        assert_eq!(payload.error_code.as_deref(), Some("NETWORK_TLS"));
+        assert!(payload.error.as_deref().unwrap().contains("分片域名"));
+    }
+
+    #[test]
+    fn hls_warning_joined_to_progress_is_kept_for_error_classification() {
+        let inner = make_inner("hls-joined-tls", "https://test/index.m3u8");
+        inner.payload.lock().unwrap().status = TaskStatus::Downloading;
+        inner.run_generation.store(1, Ordering::SeqCst);
+        hls_line("09:28:00 WARN : The SSL connection could not be established, see inner exception.Vid Kbps 0/63 0.00% -0.00Bps --:--:--", &None, &inner, 1);
+        assert!(apply_child_exit(&inner, 1, false));
+        assert_eq!(
+            inner.payload.lock().unwrap().error_code.as_deref(),
+            Some("NETWORK_TLS")
+        );
+    }
+
+    #[tokio::test]
     #[ignore = "requires native engines and local fixtures; run python scripts/smoke-hls.py"]
     async fn real_hls_download_smoke() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2285,6 +2393,7 @@ fn main() {{
         let ffmpeg = root.join("code").join(crate::locate::bin_name("ffmpeg"));
         let host = std::env::var("TEST_HLS_URL").expect("run scripts/smoke-hls.py");
         let cookies = std::env::var("TEST_HLS_COOKIES").unwrap();
+        let bad_origin = std::env::var("TEST_HLS_BAD_ORIGIN").unwrap();
         let dir = std::env::temp_dir().join(format!(
             "real-hls-{}",
             std::time::SystemTime::now()
@@ -2318,6 +2427,13 @@ fn main() {{
                 crate::command::Preset::Custom("hls-200".into()),
                 true,
                 false,
+            ),
+            ("mirror.m3u8", crate::command::Preset::Best, true, false),
+            (
+                "mirror-encrypted.m3u8",
+                crate::command::Preset::Best,
+                true,
+                true,
             ),
         ];
         for (index, (suffix, preset, expect_video, expect_audio)) in cases.into_iter().enumerate() {
@@ -2374,10 +2490,31 @@ fn main() {{
             };
             let base = dir.join(format!("Fixture.with.dots-{index}"));
             let is_hls = source.is_some();
+            let mut prepared = None;
             let args = if let Some(source) = source.as_mut() {
                 add_cookie_header(source, &cookies).unwrap();
-                crate::m3u8::build_args(&cfg, source, &base, &dir.join(format!("tmp-{index}")))
-                    .unwrap()
+                let checked = crate::hls_preflight::prepare(
+                    &cfg,
+                    source,
+                    &[crate::hls_preflight::MirrorRule {
+                        from_origin: bad_origin.clone(),
+                        to_origin: host.clone(),
+                        path_prefix: "/video/".into(),
+                    }],
+                    &dir.join(format!("preflight-{index}")),
+                    source.cookie_text.clone(),
+                )
+                .await
+                .unwrap();
+                if index >= 5 {
+                    assert!(!checked.plan.routes.is_empty());
+                }
+                let mut args =
+                    crate::m3u8::build_args(&cfg, source, &base, &dir.join(format!("tmp-{index}")))
+                        .unwrap();
+                args[0] = checked.input.clone();
+                prepared = Some(checked);
+                args
             } else {
                 build_args(&cfg)
             };
@@ -2393,6 +2530,7 @@ fn main() {{
                 is_hls.then_some(HlsRun {
                     output_base: base.clone(),
                     format: "mp4".into(),
+                    _prepared: prepared,
                 }),
             )
             .unwrap();

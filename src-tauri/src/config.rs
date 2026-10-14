@@ -35,6 +35,10 @@ pub struct GlobalSettings {
     pub m3u8dl_path: Option<String>,
     #[serde(default = "default_use_m3u8dl")]
     pub use_m3u8dl: bool,
+    #[serde(default = "default_use_m3u8dl")]
+    pub hls_preflight: bool,
+    #[serde(default)]
+    pub hls_mirrors: Vec<crate::hls_preflight::MirrorRule>,
     #[serde(default = "default_merge")]
     pub merge_format: String,
 }
@@ -74,6 +78,8 @@ impl Default for GlobalSettings {
             ffmpeg_path: None,
             m3u8dl_path: None,
             use_m3u8dl: true,
+            hls_preflight: true,
+            hls_mirrors: Vec::new(),
             merge_format: default_merge(),
         }
     }
@@ -158,6 +164,13 @@ pub fn save_settings(app: AppHandle, settings: GlobalSettings) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_settings_enable_checks_without_trusting_unknown_mirrors() {
+        let s: GlobalSettings = serde_json::from_str("{}").unwrap();
+        assert!(s.hls_preflight);
+        assert!(s.hls_mirrors.is_empty());
+    }
 
     #[test]
     fn settings_json_uses_camel_case() {

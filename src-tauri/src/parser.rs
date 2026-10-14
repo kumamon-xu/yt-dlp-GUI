@@ -69,6 +69,22 @@ pub fn classify_error(stderr: &str) -> AppError {
         ("PROCESS_FAILED", "无法解析或需要登录/地区限制")
     } else if lower.contains("private video") {
         ("AUTH_REQUIRED", "私密视频：需要登录且有权限")
+    } else if lower.contains("ssl connection could not be established")
+        || lower.contains("ssl: unexpected_eof")
+        || lower.contains("sslerror")
+        || lower.contains("ssl/tls connection failed")
+        || lower.contains("tls handshake")
+        || lower.contains("certificate_verify_failed")
+    {
+        (
+            "NETWORK_TLS",
+            "下载服务器的 SSL/TLS 连接失败，请检查分片域名是否可访问，或配置代理后重试",
+        )
+    } else if lower.contains("download first segment failed") {
+        (
+            "HLS_SEGMENT_FAILED",
+            "HLS 首个分片下载失败，请检查分片地址、代理和 Cookies",
+        )
     } else if lower.contains("unable to download") && lower.contains("proxy") {
         ("NETWORK_TIMEOUT", "代理连接失败")
     } else if lower.contains("timed out")
@@ -157,6 +173,30 @@ mod tests {
         let s = friendly_error("line1\nweird unknown boom");
         assert!(s.starts_with("失败："), "{s}");
         assert!(!s.contains("解析失败"));
+    }
+
+    #[test]
+    fn tls_failure_is_reported_before_the_hls_exception_stack() {
+        let err = classify_error("WARN : The SSL connection could not be established, see inner exception.\nUnhandled exception: System.Exception: Download first segment failed!\n   at InvocationPipeline.InvokeAsync()");
+        assert_eq!(err.code, "NETWORK_TLS");
+        assert!(err.title.contains("分片域名"));
+        assert!(!err.title.contains("InvocationPipeline"));
+        for message in [
+            "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol",
+            "curl: (35) SSL/TLS connection failed",
+            "TLS handshake failed",
+            "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed",
+        ] {
+            assert_eq!(classify_error(message).code, "NETWORK_TLS", "{message}");
+        }
+    }
+
+    #[test]
+    fn hls_segment_failure_does_not_claim_a_tls_cause_without_evidence() {
+        let err = classify_error("Unhandled exception: System.Exception: Download first segment failed!\n   at InvocationPipeline.InvokeAsync()");
+        assert_eq!(err.code, "HLS_SEGMENT_FAILED");
+        assert!(err.title.contains("首个分片"));
+        assert!(!err.title.contains("SSL"));
     }
 
     #[test]

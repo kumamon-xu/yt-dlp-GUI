@@ -12,16 +12,13 @@ Windows, Linux, and macOS. Defaults to Chinese UI (English available). Optimized
 
 **Download:** [latest installer](https://github.com/kumamon-xu/yt-dlp-GUI/releases/latest)
 
-## v0.3.1 更新
+## v0.4.0 更新
 
-- 集成 N_m3u8DL-RE：支持 m3u8 直链、兼容的视频页面自动解析及 AES-128 HLS 下载。
-- 新增工具路径设置、状态检查、HLS 下载百分比及任务引擎标识。
-- 保留具体流 URL；无法准确映射的多轨选择继续由 yt-dlp 下载，避免改变编码、帧率或音轨。
-- 修复 HLS 限速换算：`1M` 表示 1 MiB/s。
-- 修复自动保存撤销会话预设、下载按钮覆盖面板预设，以及保存新目录后仍使用旧目录的问题。
-- 修复 Linux AppImage 打包改写 RE 原生程序导致的崩溃；Linux 使用经 SHA-256 校验的压缩资源，运行时解压到本地缓存，保留原始程序字节。
-
----
+- 默认启用 RE 点播任务启动检查：抽查首、中、尾分片，验证密钥、AES-128 解密及初始化文件。
+- 新增可信备用映射设置；原地址失败且候选镜像通过验证后，生成临时清单自动切换。
+- 保留路径、签名参数、字节范围、时间轴以及具体流选择；暂停或取消时终止检查并清理临时清单。
+- 修复 HLS 的 SSL 错误提示，避免进度输出和异常堆栈覆盖底层原因。
+- 为后续下载途中恢复保留请求上下文及线路计划接口。本版恢复发生在任务启动阶段。
 
 ## Features
 
@@ -109,8 +106,8 @@ The packaged app copies `code/yt-dlp`, `code/ffmpeg`, and `code/N_m3u8DL-RE` as 
 
 ```bash
 # bump package.json, src-tauri/Cargo.toml, src-tauri/Cargo.lock and src-tauri/tauri.conf.json
-git tag -a v0.3.1 -m "yt-dlp GUI v0.3.1"
-git push origin v0.3.1
+git tag -a v0.4.0 -m "yt-dlp GUI v0.4.0"
+git push origin v0.4.0
 ```
 
 CI downloads platform-native yt-dlp + ffmpeg + N_m3u8DL-RE into `code/` before `tauri build`. Installers are unsigned (Windows SmartScreen / macOS Gatekeeper may warn). To sign macOS builds, add `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, and related secrets to the repository, then expose them to the reusable build workflow's installer step.
@@ -143,8 +140,15 @@ CI downloads platform-native yt-dlp + ffmpeg + N_m3u8DL-RE into `code/` before `
 - m3u8 任务支持暂停和取消；继续时重新解析并重新下载分片，不承诺断点续传。旧队列和旧设置可继续使用。
 - 视频页面沿用文件名模板，并追加任务 ID 防止并发任务覆盖文件；直链缺少网页元数据，使用清单名称和任务 ID。支持 MP4、MKV、TS 容器。
 - Cookies 文件优先于浏览器；浏览器 Cookies 通过 yt-dlp 临时导出，转换为请求头后删除临时文件。解析得到的流 URL 不替换持久化任务中的原始页面 URL。
+- 清单可解析时，分片仍可能由其他 CDN 域名提供。出现「SSL/TLS 连接失败」或「首个分片下载失败」时，请检查日志中的分片域名、代理和 Cookies；重新解析同一个清单通常无法修复不可访问的分片 CDN。
 
-本地完整验证（需要 `code/` 中的三个真实引擎）：`python scripts/smoke-hls.py`。它生成带独立音轨、同分辨率不同编码/帧率及 AES-128 加密的 HLS，使用要求 Cookies/Referer 的本地服务器，验证页面解析、具体流选择、多轨回退和 RE 的真实限速。
+设置中默认开启「下载前检查 HLS 点播分片」。在「可信 HLS 备用地址」中添加原地址、备用地址及适用路径前缀，例如 `https://cdn.example.com` → `https://backup.example.com`，路径 `/videos/`。镜像必须提供同一媒体、密钥和字节范围；程序只尝试明确配置的映射，不从域名名称推断镜像。HTTP 401/403/429 会提示认证或限流原因，不通过换域名掩盖这些错误。请勿将带认证信息或签名参数的 URL 填进映射设置。
+
+检查使用任务的代理和请求头，通过实际 GET 请求验证媒体内容，单个分片样本最多读取 64 KiB。主清单按照预设清晰度限制和带宽确定视频流，并保留关联音轨；明确选择的单一媒体流仍使用其原始 URL。密钥和初始化文件另行检查，必要时验证 AES-128 解密。验证成功后使用私有临时清单，结束、暂停或取消后清理，队列中仍保存原始任务 URL。每次继续任务会重新检查，不缓存长期有效的签名地址。
+
+本版仅在 RE 任务启动阶段检查和修复。直播、变量清单、其他加密方式及加密字节范围流沿用 RE；复杂多轨选择和 yt-dlp 后处理任务沿用 yt-dlp。镜像需要不同 Cookie/Authorization 时不会跨域转发原认证头；这类请求需要后续的分片请求服务。抽样检查不能保证未抽查分片可用，下载途中自动恢复尚未实现。可关闭启动检查以沿用此前的直接下载方式。
+
+本地完整验证（需要 `code/` 中的三个真实引擎）：`python scripts/smoke-hls.py`。它生成带独立音轨、同分辨率不同编码/帧率及 AES-128 加密的 HLS，使用要求 Cookies/Referer 的本地服务器，验证启动检查、普通/AES-128 分片的可信镜像切换、页面解析、具体流选择、多轨回退和 RE 的真实限速。
 
 ---
 
@@ -161,6 +165,7 @@ src-tauri/src/        # Rust: process pool, arg builder, queue
   tasks.rs            # spawn / kill tree / concurrency
   info.rs             # -J preview
   m3u8.rs             # HLS routing, RE arguments and progress
+  hls_preflight.rs    # VOD probes, trusted mappings and recovery plans
   config.rs           # settings JSON + folder picker
 ```
 

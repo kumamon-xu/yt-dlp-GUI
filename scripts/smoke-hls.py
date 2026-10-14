@@ -5,6 +5,7 @@ import http.server
 import math
 import os
 import pathlib
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -29,6 +30,14 @@ class FixtureHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_error(403, "referer required")
                 return
         super().do_GET()
+
+    def log_message(self, *args):
+        pass
+
+
+class FailedCdnHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_error(503, "fixture CDN unavailable")
 
     def log_message(self, *args):
         pass
@@ -64,8 +73,19 @@ def main():
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(FixtureHandler, directory=str(fixture)))
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
+        bad_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FailedCdnHandler)
+        threading.Thread(target=bad_server.serve_forever, daemon=True).start()
+        bad_origin = f"http://127.0.0.1:{bad_server.server_port}"
+        (fixture / "video").mkdir()
+        for payload in [*fixture.glob("*.ts"), fixture / "enc.key"]:
+            shutil.copyfile(payload, fixture / "video" / payload.name)
+        for source, target in [("video.m3u8", "mirror.m3u8"), ("encrypted.m3u8", "mirror-encrypted.m3u8")]:
+            text = (fixture / source).read_text()
+            text = text.replace('URI="enc.key"', f'URI="{bad_origin}/video/enc.key"')
+            text = '\n'.join(f'{bad_origin}/video/{line}' if line and not line.startswith('#') else line for line in text.splitlines()) + '\n'
+            (fixture / target).write_text(text)
         env = {**os.environ, "TEST_HLS_URL": f"http://127.0.0.1:{server.server_port}", "TEST_HLS_COOKIES": str(fixture / "cookies.txt"),
-               "TEST_HLS_RATE_BYTES": str(8 * len(rate_segment))}
+               "TEST_HLS_RATE_BYTES": str(8 * len(rate_segment)), "TEST_HLS_BAD_ORIGIN": bad_origin}
         try:
             result = subprocess.run(["cargo", "test", "--manifest-path", str(ROOT / "src-tauri/Cargo.toml"), "--lib",
                 "real_hls_", "--", "--ignored", "--nocapture"], env=env, cwd=ROOT, creationflags=CREATE_NO_WINDOW,
@@ -75,6 +95,8 @@ def main():
         finally:
             server.shutdown()
             server.server_close()
+            bad_server.shutdown()
+            bad_server.server_close()
 
 
 if __name__ == "__main__":

@@ -97,6 +97,7 @@ pub fn validate_playlist_items(raw: Option<&str>) -> Result<Option<String>, Stri
 }
 
 pub fn validate_settings(s: &GlobalSettings) -> Result<(), String> {
+    crate::hls_preflight::validate_rules(&s.hls_mirrors)?;
     validate_concurrent_fragments(s.concurrent_fragments)?;
     validate_max_concurrent_tasks(s.max_concurrent_tasks)?;
     validate_limit_rate(s.limit_rate.as_deref())?;

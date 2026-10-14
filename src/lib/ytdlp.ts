@@ -129,6 +129,12 @@ export interface TaskPayload {
   kind?: TaskKind;
 }
 
+export interface HlsMirrorRule {
+  fromOrigin: string;
+  toOrigin: string;
+  pathPrefix: string;
+}
+
 export interface GlobalSettings {
   defaultPreset: string;
   outDir: string;
@@ -143,6 +149,8 @@ export interface GlobalSettings {
   ffmpegPath: string | null;
   m3u8dlPath?: string | null;
   useM3u8dl?: boolean;
+  hlsPreflight?: boolean;
+  hlsMirrors?: HlsMirrorRule[];
   mergeFormat: string;
 }
 

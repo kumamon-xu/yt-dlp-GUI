@@ -13,6 +13,7 @@ pub struct HlsSource {
     pub filename: Option<String>,
     pub headers: BTreeMap<String, String>,
     pub resolved: bool,
+    pub cookie_text: Option<String>,
 }
 
 pub fn is_m3u8_url(url: &str) -> bool {
@@ -48,6 +49,7 @@ pub fn direct_source(url: &str) -> HlsSource {
         filename: None,
         headers: BTreeMap::new(),
         resolved: false,
+        cookie_text: None,
     }
 }
 
@@ -202,6 +204,7 @@ pub fn source_from_info(v: &Value) -> Option<HlsSource> {
             .map(String::from),
         headers,
         resolved: true,
+        cookie_text: None,
     })
 }
 

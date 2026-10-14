@@ -1,6 +1,6 @@
 [package]
 name = "yt_dlp_gui"
-version = "0.3.1"
+version = "0.4.0"
 description = "A modern GUI for yt-dlp"
 authors = ["you"]
 edition = "2021"
@@ -23,6 +23,9 @@ sha2 = "0.10"
 url = "2"
 regex = "1"
 flate2 = "1"
+reqwest = { version = "0.13.4", default-features = false, features = ["native-tls", "socks"] }
+aes = "0.8"
+cbc = "0.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

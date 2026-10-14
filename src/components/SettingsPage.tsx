@@ -18,6 +18,8 @@ const emptySettings = (): GlobalSettings => ({
   ffmpegPath: null,
   m3u8dlPath: null,
   useM3u8dl: true,
+  hlsPreflight: true,
+  hlsMirrors: [],
   mergeFormat: "mp4",
 });
 
@@ -123,6 +125,43 @@ export default function SettingsPage() {
             {t("settings.useM3u8dl")}
           </label>
           <p className="text-[11px] text-slate-500">{t("settings.m3u8dlHint")}</p>
+          <label className="flex items-center gap-2 text-xs text-slate-300">
+            <input type="checkbox" checked={draft.hlsPreflight ?? true}
+              onChange={(e) => patch({ hlsPreflight: e.target.checked })} />
+            {t("settings.hlsPreflight")}
+          </label>
+          <p className="text-[11px] text-slate-500">{t("settings.hlsPreflightHint")}</p>
+          <div className="space-y-2 rounded-md border border-slate-700 p-2">
+            <p className="text-xs text-slate-300">{t("settings.hlsMirrors")}</p>
+            <p className="text-[11px] text-slate-500">{t("settings.hlsMirrorsHint")}</p>
+            {(draft.hlsMirrors ?? []).map((rule, index) => {
+              const update = (value: Partial<typeof rule>) => patch({
+                hlsMirrors: (draft.hlsMirrors ?? []).map((r, i) => i === index ? { ...r, ...value } : r),
+              });
+              return <div key={index} className="space-y-1 rounded border border-slate-800 p-2">
+                <label className="block text-[11px] text-slate-500">{t("settings.hlsFrom")}
+                  <input className={`${field} mt-1`} placeholder="https://cdn.example.com" value={rule.fromOrigin}
+                    onChange={(e) => update({ fromOrigin: e.target.value.trim() })} />
+                </label>
+                <label className="block text-[11px] text-slate-500">{t("settings.hlsTo")}
+                  <input className={`${field} mt-1`} placeholder="https://backup.example.com" value={rule.toOrigin}
+                    onChange={(e) => update({ toOrigin: e.target.value.trim() })} />
+                </label>
+                <label className="block text-[11px] text-slate-500">{t("settings.hlsPrefix")}
+                  <input className={`${field} mt-1 font-mono`} placeholder="/videos/" value={rule.pathPrefix}
+                    onChange={(e) => update({ pathPrefix: e.target.value.trim() })} />
+                </label>
+                <button className="text-[11px] text-red-400" onClick={() => patch({
+                  hlsMirrors: (draft.hlsMirrors ?? []).filter((_, i) => i !== index),
+                })}>{t("action.remove")}</button>
+              </div>;
+            })}
+            <button className="rounded border border-slate-700 px-2 py-1 text-xs disabled:opacity-40"
+              disabled={(draft.hlsMirrors?.length ?? 0) >= 32}
+              onClick={() => patch({ hlsMirrors: [...(draft.hlsMirrors ?? []), { fromOrigin: "", toOrigin: "", pathPrefix: "/" }] })}>
+              {t("settings.hlsAdd")}
+            </button>
+          </div>
           <label className="block text-[11px] text-slate-500">
             {t("opt.dir")}
             <div className="mt-1 flex gap-1">

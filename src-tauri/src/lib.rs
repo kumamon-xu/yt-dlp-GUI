@@ -7,6 +7,7 @@ extern "C" {}
 mod command;
 mod config;
 mod fsutil;
+mod hls_preflight;
 mod info;
 mod locate;
 mod m3u8;
