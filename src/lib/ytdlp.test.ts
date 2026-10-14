@@ -11,6 +11,7 @@ import {
   resolveDownloadPreset,
   retryTaskRequest,
   settingsDraftDirty,
+  normalizeHlsMirrors,
   splitUrls,
   toolboxTask,
   type GlobalSettings,
@@ -60,6 +61,18 @@ describe("settingsDraftDirty", () => {
     expect(settingsDraftDirty(a, b)).toBe(false);
     b.defaultPreset = "best";
     expect(settingsDraftDirty(a, b)).toBe(true);
+  });
+});
+
+describe("HLS mapping scope", () => {
+  it("normalizes a blank prefix to the whole source origin and preserves directory scopes", () => {
+    expect(normalizeHlsMirrors([
+      { fromOrigin: " https://cdn.test ", toOrigin: "https://backup.test ", pathPrefix: " " },
+      { fromOrigin: "https://cdn.test", toOrigin: "https://backup.test", pathPrefix: "/videos/" },
+    ])).toEqual([
+      { fromOrigin: "https://cdn.test", toOrigin: "https://backup.test", pathPrefix: "/" },
+      { fromOrigin: "https://cdn.test", toOrigin: "https://backup.test", pathPrefix: "/videos/" },
+    ]);
   });
 });
 

@@ -12,14 +12,14 @@ Windows, Linux, and macOS. Defaults to Chinese UI (English available). Optimized
 
 **Download:** [latest installer](https://github.com/kumamon-xu/yt-dlp-GUI/releases/latest)
 
-## v0.4.1 更新
+## v0.5.0 更新
 
-- 默认启用 RE 点播任务启动检查：抽查首、中、尾分片，验证密钥、AES-128 解密及初始化文件。
-- 新增可信备用映射设置；原地址失败且候选镜像通过验证后，生成临时清单自动切换。
-- 保留路径、签名参数、字节范围、时间轴以及具体流选择；暂停或取消时终止检查并清理临时清单。
-- 修复 HLS 的 SSL 错误提示，避免进度输出和异常堆栈覆盖底层原因。
-- 修复 CI 环境关闭 RE 进度渲染导致限速计数无法重置的问题；仅调整 RE 子进程环境。
-- 为后续下载途中恢复保留请求上下文及线路计划接口。本版恢复发生在任务启动阶段。
+- 自动发现备用线路：支持主清单的稳定流 ID、Content Steering 路径克隆，以及 `javday.homes` 的资源镜像规则；不需要为该站点的每个视频手动填映射。
+- 失败后验证备用清单、首中尾分片、密钥和初始化文件，通过后使用临时清单下载；保留具体流选择、编码、帧率和音轨。
+- HLS 线路与备用映射移到独立弹窗，提供可搜索的滚动表格，单独保存，不拉长主设置。
+- 新增可取消的「分析并检查链接」：检查视频页面或 m3u8，不创建下载任务，不自动保存全站信任。
+- 路径前缀可选，留空或 `/` 覆盖源地址的全部资源；`/videos/` 可覆盖多个视频。
+- 修复并发任务在同一目录检查写入权限时的临时文件名冲突。下载途中恢复仍保留为后续接口。
 
 ## Features
 
@@ -107,8 +107,8 @@ The packaged app copies `code/yt-dlp`, `code/ffmpeg`, and `code/N_m3u8DL-RE` as 
 
 ```bash
 # bump package.json, src-tauri/Cargo.toml, src-tauri/Cargo.lock and src-tauri/tauri.conf.json
-git tag -a v0.4.1 -m "yt-dlp GUI v0.4.1"
-git push origin v0.4.1
+git tag -a v0.5.0 -m "yt-dlp GUI v0.5.0"
+git push origin v0.5.0
 ```
 
 CI downloads platform-native yt-dlp + ffmpeg + N_m3u8DL-RE into `code/` before `tauri build`. Installers are unsigned (Windows SmartScreen / macOS Gatekeeper may warn). To sign macOS builds, add `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, and related secrets to the repository, then expose them to the reusable build workflow's installer step.
@@ -143,13 +143,21 @@ CI downloads platform-native yt-dlp + ffmpeg + N_m3u8DL-RE into `code/` before `
 - Cookies 文件优先于浏览器；浏览器 Cookies 通过 yt-dlp 临时导出，转换为请求头后删除临时文件。解析得到的流 URL 不替换持久化任务中的原始页面 URL。
 - 清单可解析时，分片仍可能由其他 CDN 域名提供。出现「SSL/TLS 连接失败」或「首个分片下载失败」时，请检查日志中的分片域名、代理和 Cookies；重新解析同一个清单通常无法修复不可访问的分片 CDN。
 
-设置中默认开启「下载前检查 HLS 点播分片」。在「可信 HLS 备用地址」中添加原地址、备用地址及适用路径前缀，例如 `https://cdn.example.com` → `https://backup.example.com`，路径 `/videos/`。镜像必须提供同一媒体、密钥和字节范围；程序只尝试明确配置的映射，不从域名名称推断镜像。HTTP 401/403/429 会提示认证或限流原因，不通过换域名掩盖这些错误。请勿将带认证信息或签名参数的 URL 填进映射设置。
+设置 →「管理 HLS 线路、备用映射与自动分析」打开独立弹窗。默认开启「下载前检查 HLS 点播分片」和「自动发现并验证备用线路」。主设置只显示入口和映射数量；弹窗内的映射表格可搜索、滚动、增删并单独保存，不会撤销主设置里尚未保存的其他修改。
+
+自动发现从原主清单中提取相同稳定流 ID 的备用线路，并支持 [HLS Content Steering 的路径克隆](https://developer.apple.com/videos/play/wwdc2022/10144/)（HOST、PARAMS、单独的视频/音轨 URI）。明确点选的单一流只查找对应流的备用，不重新选择主清单的最佳流。健康的原线路保持使用；声明缺失、身份无法准确匹配时不自动改画质或音轨。Steering 在每次启动时读取，不实现下载途中的周期刷新。
+
+目前还内置 `javday.homes` 站点规则：对该站点 `/videos/` 下、与当前清单位于相同资源目录的 HTTPS 分片子域名，原线路失败后尝试站点根域名的相同资源路径，保留签名参数，再逐项验证。子域名或视频 ID 改变时会按当前清单重新分析；自动生成的规则只在该次任务的资源目录内生效，不写成永久全站信任。其他站点没有线路声明且尚未适配时，单条 m3u8 不能保证自动发现备用地址。
+
+手动「可信 HLS 备用地址」作为补充。例如 `https://cdn.example.com` → `https://backup.example.com`，路径 `/videos/` 可匹配该目录下多个视频；留空或 `/` 匹配该源地址的全部路径，只替换源地址并保留实际资源路径。不同视频不需要分别建立规则，但源域名必须准确匹配。镜像必须提供同一媒体、密钥和字节范围。HTTP 401/403/429 会提示认证或限流原因，不通过换域名掩盖这些错误。请勿将带认证信息或签名参数的 URL 填进映射设置。
+
+「分析并检查链接」使用当前设置草稿的代理、Cookies 和视频清晰度预设（音频转换预设按最佳视频分析），可在下载前显示检查结果及涉及的源地址。分析只读取清单和有限样本，不下载完整媒体、创建队列任务或持久保存签名 URL。可取消分析，关闭弹窗也会取消，清理临时清单和浏览器 Cookies 导出文件。是否关闭任务启动检查不影响用户明确发起的单次分析。
 
 检查使用任务的代理和请求头，通过实际 GET 请求验证媒体内容，单个分片样本最多读取 64 KiB。主清单按照预设清晰度限制和带宽确定视频流，并保留关联音轨；明确选择的单一媒体流仍使用其原始 URL。密钥和初始化文件另行检查，必要时验证 AES-128 解密。验证成功后使用私有临时清单，结束、暂停或取消后清理，队列中仍保存原始任务 URL。每次继续任务会重新检查，不缓存长期有效的签名地址。
 
 本版仅在 RE 任务启动阶段检查和修复。直播、变量清单、其他加密方式及加密字节范围流沿用 RE；复杂多轨选择和 yt-dlp 后处理任务沿用 yt-dlp。镜像需要不同 Cookie/Authorization 时不会跨域转发原认证头；这类请求需要后续的分片请求服务。抽样检查不能保证未抽查分片可用，下载途中自动恢复尚未实现。可关闭启动检查以沿用此前的直接下载方式。
 
-本地完整验证（需要 `code/` 中的三个真实引擎）：`python scripts/smoke-hls.py`。它生成带独立音轨、同分辨率不同编码/帧率及 AES-128 加密的 HLS，使用要求 Cookies/Referer 的本地服务器，验证启动检查、普通/AES-128 分片的可信镜像切换、页面解析、具体流选择、多轨回退和 RE 的真实限速。
+本地完整验证（需要 `code/` 中的三个真实引擎）：`python scripts/smoke-hls.py`。它生成带独立音轨、同分辨率不同编码/帧率及 AES-128 加密的 HLS，使用要求 Cookies/Referer 的本地服务器，验证启动检查、普通/AES-128 分片的可信镜像切换、无手动映射的清单备用线路与 Steering 克隆、页面解析、具体流选择、多轨回退和 RE 的真实限速。
 
 ---
 
@@ -167,6 +175,7 @@ src-tauri/src/        # Rust: process pool, arg builder, queue
   info.rs             # -J preview
   m3u8.rs             # HLS routing, RE arguments and progress
   hls_preflight.rs    # VOD probes, trusted mappings and recovery plans
+  hls_discovery.rs    # provider-declared alternatives and site adapters
   config.rs           # settings JSON + folder picker
 ```
 

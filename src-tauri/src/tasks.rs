@@ -850,12 +850,13 @@ async fn spawn_download(app: AppHandle, inner: Arc<TaskInner>, gen: u64) -> Resu
                 serde_json::json!({"id":id,"line":"正在检查 HLS 点播分片和可信备用地址…"}),
             );
             let preflight_dir = tmp.join(format!("preflight-{gen}"));
-            let check = crate::hls_preflight::prepare(
+            let check = crate::hls_preflight::prepare_with_discovery(
                 &cfg_preview,
                 &source,
                 &settings.hls_mirrors,
                 &preflight_dir,
                 source.cookie_text.clone(),
+                settings.hls_auto_discovery,
             );
             tokio::pin!(check);
             let result = loop {
@@ -912,6 +913,156 @@ fn still_starting(inner: &TaskInner, gen: u64) -> bool {
     inner.run_generation.load(Ordering::SeqCst) == gen
         && !inner.canceled.load(Ordering::SeqCst)
         && inner.payload.lock().unwrap().status == TaskStatus::Starting
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HlsAnalysis {
+    messages: Vec<String>,
+    domains: Vec<String>,
+    routes: Vec<crate::hls_preflight::MirrorRule>,
+    playlist_switches: usize,
+}
+
+fn analyses() -> &'static Mutex<HashMap<String, Arc<TaskInner>>> {
+    static ACTIVE: std::sync::OnceLock<Mutex<HashMap<String, Arc<TaskInner>>>> =
+        std::sync::OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cancelled_analyses() -> &'static Mutex<VecDeque<String>> {
+    static CANCELLED: std::sync::OnceLock<Mutex<VecDeque<String>>> = std::sync::OnceLock::new();
+    CANCELLED.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+struct AnalysisGuard(String);
+impl Drop for AnalysisGuard {
+    fn drop(&mut self) {
+        if let Some(inner) = analyses().lock().unwrap().remove(&self.0) {
+            inner.canceled.store(true, Ordering::SeqCst);
+            kill_process_tree_grace(inner.pid.load(Ordering::SeqCst), std::time::Duration::ZERO);
+        }
+    }
+}
+
+#[tauri::command]
+pub fn cancel_hls_analysis(id: String) {
+    if id.is_empty() || id.len() > 64 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return;
+    }
+    if let Some(inner) = analyses().lock().unwrap().get(&id) {
+        inner.canceled.store(true, Ordering::SeqCst);
+    } else {
+        // IPC cancellation can arrive before the async analysis starts polling.
+        let mut cancelled = cancelled_analyses().lock().unwrap();
+        if !cancelled.contains(&id) {
+            cancelled.push_back(id);
+        }
+        if cancelled.len() > 32 {
+            cancelled.pop_front();
+        }
+    }
+}
+
+/// Same startup checks as a real task, with no queue entry and no media download.
+#[tauri::command]
+pub async fn analyze_hls(
+    app: AppHandle,
+    id: String,
+    url: String,
+    settings: crate::GlobalSettings,
+) -> Result<HlsAnalysis, String> {
+    if id.is_empty() || id.len() > 64 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err("分析请求 ID 无效".into());
+    }
+    crate::hls_preflight::http_url(&url)?;
+    crate::validate::validate_settings(&settings)?;
+    let preset = if matches!(settings.default_preset.as_str(), "720p" | "1080p") {
+        settings.default_preset.as_str()
+    } else {
+        "best"
+    };
+    let mut task: NewTask =
+        serde_json::from_value(serde_json::json!({"url":url,"noPlaylist":true,"preset":preset}))
+            .map_err(|_| "分析参数无效")?;
+    apply_settings(&mut task, &settings);
+    let inner = new_task_inner(id.clone(), task.clone());
+    inner.payload.lock().unwrap().status = TaskStatus::Starting;
+    inner.run_generation.store(1, Ordering::SeqCst);
+    {
+        let mut active = analyses().lock().unwrap();
+        let mut cancelled = cancelled_analyses().lock().unwrap();
+        if let Some(index) = cancelled.iter().position(|c| c == &id) {
+            cancelled.remove(index);
+            return Err("HLS 分析已取消".into());
+        }
+        if !active.is_empty() {
+            return Err("另一个 HLS 分析正在进行，请稍后重试".into());
+        }
+        active.insert(id.clone(), inner.clone());
+    }
+    let _guard = AnalysisGuard(id.clone());
+    let cfg = task.to_config();
+    let future = async {
+        let mut source = if crate::m3u8::direct_auto(&cfg)
+            && cfg.cookies_browser.as_ref().is_none_or(|s| s.is_empty())
+        {
+            crate::m3u8::direct_source(&cfg.url)
+        } else {
+            let engine = find_engine(settings.engine_path.as_deref())?;
+            resolve_task_source(&app, &inner, 1, &engine, &cfg)
+                .await?
+                .ok_or("此页面未解析出可准确映射的单一 HLS 流；多轨或后处理任务继续使用 yt-dlp")?
+        };
+        if let Some(path) = cfg.cookies_file.as_deref().filter(|s| !s.is_empty()) {
+            add_cookie_header(&mut source, path)?;
+        }
+        if !source
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("user-agent"))
+        {
+            source
+                .headers
+                .insert("User-Agent".into(), "Mozilla/5.0".into());
+        }
+        if !source
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("referer"))
+        {
+            source.headers.insert("Referer".into(), cfg.url.clone());
+        }
+        let directory = crate::config::config_dir(&app)?
+            .join("hls-analysis")
+            .join(&id);
+        let prepared = crate::hls_preflight::prepare_with_discovery(
+            &cfg,
+            &source,
+            &settings.hls_mirrors,
+            &directory,
+            source.cookie_text.clone(),
+            settings.hls_auto_discovery,
+        )
+        .await?;
+        Ok(HlsAnalysis {
+            messages: prepared.messages.clone(),
+            domains: prepared.domains.clone(),
+            routes: prepared.plan.routes.clone(),
+            playlist_switches: prepared.playlist_switches,
+        })
+    };
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            result = &mut future => return result,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                if inner.canceled.load(Ordering::SeqCst) { return Err("HLS 分析已取消".into()); }
+            }
+        }
+    }
 }
 
 fn unique_hls_base(base: std::path::PathBuf, format: &str, id: &str) -> std::path::PathBuf {
@@ -2370,6 +2521,26 @@ fn main() {{
     }
 
     #[test]
+    fn cancelling_analysis_is_isolated_and_guard_releases_the_session() {
+        let inner = make_inner("analysis-cancel", "https://test/index.m3u8");
+        let download = make_inner("unrelated-download", "https://test/video");
+        analyses()
+            .lock()
+            .unwrap()
+            .insert("analysis-cancel".into(), inner.clone());
+        let guard = AnalysisGuard("analysis-cancel".into());
+        cancel_hls_analysis("analysis-cancel".into());
+        assert!(inner.canceled.load(Ordering::SeqCst));
+        assert!(!download.canceled.load(Ordering::SeqCst));
+        drop(guard);
+        assert!(!analyses().lock().unwrap().contains_key("analysis-cancel"));
+        cancel_hls_analysis("analysis-not-started".into());
+        let mut early = cancelled_analyses().lock().unwrap();
+        assert!(early.contains(&"analysis-not-started".into()));
+        early.retain(|id| id != "analysis-not-started");
+    }
+
+    #[test]
     fn hls_warning_joined_to_progress_is_kept_for_error_classification() {
         let inner = make_inner("hls-joined-tls", "https://test/index.m3u8");
         inner.payload.lock().unwrap().status = TaskStatus::Downloading;
@@ -2438,6 +2609,18 @@ fn main() {{
                 true,
                 true,
             ),
+            (
+                "auto-master.m3u8",
+                crate::command::Preset::Best,
+                true,
+                false,
+            ),
+            (
+                "auto-steering.m3u8",
+                crate::command::Preset::Best,
+                true,
+                false,
+            ),
         ];
         for (index, (suffix, preset, expect_video, expect_audio)) in cases.into_iter().enumerate() {
             let url = format!("{host}/{suffix}");
@@ -2496,21 +2679,30 @@ fn main() {{
             let mut prepared = None;
             let args = if let Some(source) = source.as_mut() {
                 add_cookie_header(source, &cookies).unwrap();
-                let checked = crate::hls_preflight::prepare(
-                    &cfg,
-                    source,
-                    &[crate::hls_preflight::MirrorRule {
+                let rules = if index < 7 {
+                    vec![crate::hls_preflight::MirrorRule {
                         from_origin: bad_origin.clone(),
                         to_origin: host.clone(),
-                        path_prefix: "/video/".into(),
-                    }],
+                        path_prefix: "".into(),
+                    }]
+                } else {
+                    vec![]
+                };
+                let checked = crate::hls_preflight::prepare_with_discovery(
+                    &cfg,
+                    source,
+                    &rules,
                     &dir.join(format!("preflight-{index}")),
                     source.cookie_text.clone(),
+                    index >= 7,
                 )
                 .await
                 .unwrap();
-                if index >= 5 {
+                if matches!(index, 5 | 6) {
                     assert!(!checked.plan.routes.is_empty());
+                }
+                if index >= 7 {
+                    assert_eq!(checked.playlist_switches, 1);
                 }
                 let mut args =
                     crate::m3u8::build_args(&cfg, source, &base, &dir.join(format!("tmp-{index}")))

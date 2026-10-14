@@ -7,6 +7,7 @@ extern "C" {}
 mod command;
 mod config;
 mod fsutil;
+mod hls_discovery;
 mod hls_preflight;
 mod info;
 mod locate;
@@ -617,6 +618,8 @@ pub fn run() {
             tasks::resume_task,
             tasks::list_tasks,
             tasks::open_folder,
+            tasks::analyze_hls,
+            tasks::cancel_hls_analysis,
             config::load_settings,
             config::save_settings,
             config::pick_dir,

@@ -27,6 +27,7 @@ import {
   toolboxTask,
   toolError,
   type GlobalSettings,
+  type HlsSettings,
   type NewTask,
   type TaskPayload,
   type ToolStatus,
@@ -109,7 +110,8 @@ interface AppState {
   commandPreview: string;
   refreshCommand: () => Promise<void>;
   loadAllSettings: () => Promise<void>;
-  persistSettings: (s: GlobalSettings, source?: "settings" | "options") => Promise<void>;
+  persistSettings: (s: GlobalSettings, source?: "settings" | "options" | "hls") => Promise<void>;
+  persistHlsSettings: (s: HlsSettings) => Promise<void>;
 
   settingsOpen: boolean;
   setSettingsOpen: (v: boolean) => void;
@@ -448,7 +450,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
   persistSettings: async (settings, source = "settings") => {
-    if (source === "settings" && persistTimer) {
+    if (source !== "options" && persistTimer) {
       clearTimeout(persistTimer);
       persistTimer = null;
     }
@@ -458,7 +460,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (token !== saveSeq) return;
     set((state) => ({
       settings,
-      options: source === "options" ? state.options : {
+      options: source !== "settings" ? state.options : {
         ...state.options,
         ...(settings.defaultPreset !== previous?.defaultPreset ? { preset: settings.defaultPreset || state.options.preset } : {}),
         outDir: settings.outDir,
@@ -473,6 +475,19 @@ export const useAppStore = create<AppState>((set, get) => ({
     }));
     void get().refresh();
     void get().refreshCommand();
+  },
+
+  persistHlsSettings: async (hls) => {
+    const cur = get().settings;
+    if (!cur) throw new Error("Settings are not loaded");
+    const o = get().options;
+    await get().persistSettings({
+      ...cur, outDir: o.outDir, outTemplate: o.outTemplate || cur.outTemplate,
+      concurrentFragments: o.concurrentFragments || cur.concurrentFragments,
+      limitRate: o.limitRate || null, proxy: o.proxy || null,
+      cookiesBrowser: o.cookiesBrowser || null, cookiesFile: o.cookiesFile || null,
+      ...hls,
+    }, "hls");
   },
 
   settingsOpen: false,

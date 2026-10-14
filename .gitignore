@@ -94,6 +94,7 @@ queue.json
 /.playwright-cli/
 /playwright-report/
 /test-results/
+/output/playwright/
 
 # Downloaded media and HLS work files (not source assets)
 /downloads/

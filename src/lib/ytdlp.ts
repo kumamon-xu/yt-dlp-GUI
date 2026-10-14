@@ -150,6 +150,7 @@ export interface GlobalSettings {
   m3u8dlPath?: string | null;
   useM3u8dl?: boolean;
   hlsPreflight?: boolean;
+  hlsAutoDiscovery?: boolean;
   hlsMirrors?: HlsMirrorRule[];
   mergeFormat: string;
 }
@@ -166,6 +167,21 @@ export const openFolder = (path: string) => invoke<void>("open_folder", { path }
 export const buildCommand = (task: NewTask) => invoke<string>("build_command", { task });
 export const loadSettings = () => invoke<GlobalSettings>("load_settings");
 export const saveSettings = (settings: GlobalSettings) => invoke<void>("save_settings", { settings });
+
+export type HlsSettings = Pick<GlobalSettings, "hlsPreflight" | "hlsAutoDiscovery" | "hlsMirrors">;
+export interface HlsAnalysis {
+  messages: string[];
+  domains: string[];
+  routes: HlsMirrorRule[];
+  playlistSwitches: number;
+}
+export const analyzeHls = (id: string, url: string, settings: GlobalSettings) =>
+  invoke<HlsAnalysis>("analyze_hls", { id, url, settings });
+export const cancelHlsAnalysis = (id: string) => invoke<void>("cancel_hls_analysis", { id });
+
+export function normalizeHlsMirrors(rules: HlsMirrorRule[]): HlsMirrorRule[] {
+  return rules.map((r) => ({ fromOrigin: r.fromOrigin.trim(), toOrigin: r.toOrigin.trim(), pathPrefix: r.pathPrefix.trim() || "/" }));
+}
 export const pickDir = () => invoke<string | null>("pick_dir");
 export const pickFile = () => invoke<string | null>("pick_file");
 export const updateEngine = () => invoke<EngineUpdateResult>("update_engine");

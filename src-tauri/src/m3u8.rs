@@ -14,6 +14,7 @@ pub struct HlsSource {
     pub headers: BTreeMap<String, String>,
     pub resolved: bool,
     pub cookie_text: Option<String>,
+    pub manifest_url: Option<String>,
 }
 
 pub fn is_m3u8_url(url: &str) -> bool {
@@ -50,6 +51,7 @@ pub fn direct_source(url: &str) -> HlsSource {
         headers: BTreeMap::new(),
         resolved: false,
         cookie_text: None,
+        manifest_url: None,
     }
 }
 
@@ -205,6 +207,7 @@ pub fn source_from_info(v: &Value) -> Option<HlsSource> {
         headers,
         resolved: true,
         cookie_text: None,
+        manifest_url: video["manifest_url"].as_str().map(String::from),
     })
 }
 

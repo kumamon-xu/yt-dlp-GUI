@@ -66,12 +66,23 @@ describe("session presets and preview downloads", () => {
 });
 
 describe("settings and shared options", () => {
+  it("saves HLS independently without reverting pending session options or stream selection", async () => {
+    useAppStore.getState().setOptions({ preset: "720p", outDir: "D:/new", proxy: "http://new:7890" });
+    useAppStore.getState().selectFormat("v-1080");
+    const hls = { hlsAutoDiscovery: false, hlsPreflight: true, hlsMirrors: [{ fromOrigin: "https://a.test", toOrigin: "https://b.test", pathPrefix: "/" }] };
+    await useAppStore.getState().persistHlsSettings(hls);
+    expect(useAppStore.getState().options).toMatchObject({ preset: "720p", outDir: "D:/new", proxy: "http://new:7890" });
+    expect(useAppStore.getState().selectedFormat).toBe("v-1080");
+    expect(vi.mocked(saveSettings).mock.lastCall?.[0]).toMatchObject({ ...hls, outDir: "D:/new", proxy: "http://new:7890", defaultPreset: "mp4" });
+    await vi.advanceTimersByTimeAsync(401);
+    expect(saveSettings).toHaveBeenCalledOnce();
+  });
   it("retains trusted HLS mappings across ordinary options autosaves", async () => {
     const hlsMirrors = [{ fromOrigin: "https://cdn.test", toOrigin: "https://backup.test", pathPrefix: "/video/" }];
-    await useAppStore.getState().persistSettings({ ...settings(), hlsPreflight: true, hlsMirrors });
+    await useAppStore.getState().persistSettings({ ...settings(), hlsPreflight: true, hlsAutoDiscovery: false, hlsMirrors });
     useAppStore.getState().setOptions({ preset: "720p", concurrentFragments: 8 });
     await vi.advanceTimersByTimeAsync(401);
-    expect(vi.mocked(saveSettings).mock.lastCall?.[0]).toMatchObject({ hlsPreflight: true, hlsMirrors });
+    expect(vi.mocked(saveSettings).mock.lastCall?.[0]).toMatchObject({ hlsPreflight: true, hlsAutoDiscovery: false, hlsMirrors });
     expect(useAppStore.getState().settings?.hlsMirrors).toEqual(hlsMirrors);
     expect(useAppStore.getState().options.preset).toBe("720p");
   });

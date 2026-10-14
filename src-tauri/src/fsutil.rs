@@ -170,10 +170,21 @@ pub fn ensure_writable_dir(dir: &Path) -> Result<(), String> {
     if !meta.is_dir() {
         return Err(format!("输出路径不是目录: {}", dir.display()));
     }
-    let probe = dir.join(format!(".ytdlp-wtest-{}", std::process::id()));
-    fs::write(&probe, b"ok").map_err(|e| format!("输出目录不可写 {}: {e}", dir.display()))?;
+    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let probe = dir.join(format!(
+        ".ytdlp-wtest-{}-{}",
+        std::process::id(),
+        PROBE_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|e| format!("输出目录不可写 {}: {e}", dir.display()))?;
+    let result = file.write_all(b"ok");
+    drop(file);
     let _ = fs::remove_file(&probe);
-    Ok(())
+    result.map_err(|e| format!("输出目录不可写 {}: {e}", dir.display()))
 }
 
 #[cfg(test)]
@@ -192,6 +203,30 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
+    }
+
+    #[test]
+    fn concurrent_directory_checks_do_not_share_probe_files() {
+        let path = tmp_path("probe.json");
+        let directory = path.parent().unwrap().to_path_buf();
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let workers: Vec<_> = (0..16)
+            .map(|_| {
+                let directory = directory.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..10 {
+                        ensure_writable_dir(&directory).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        fs::remove_dir(&directory).unwrap();
     }
 
     #[test]

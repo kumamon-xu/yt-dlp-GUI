@@ -2,6 +2,7 @@
 """Run the real Rust HLS pipeline against local, authenticated HLS fixtures."""
 import functools
 import http.server
+import json
 import os
 import pathlib
 import shutil
@@ -74,6 +75,14 @@ def main():
         bad_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FailedCdnHandler)
         threading.Thread(target=bad_server.serve_forever, daemon=True).start()
         bad_origin = f"http://127.0.0.1:{bad_server.server_port}"
+        good_host = f"127.0.0.1:{server.server_port}"
+        same_stream = 'BANDWIDTH=200000,RESOLUTION=160x90,FRAME-RATE=10.000,CODECS="avc1.42e00a"'
+        (fixture / "auto-master.m3u8").write_text(f'#EXTM3U\n#EXT-X-STREAM-INF:{same_stream},STABLE-VARIANT-ID="video"\n{bad_origin}/video.m3u8\n'
+            f'#EXT-X-STREAM-INF:{same_stream},STABLE-VARIANT-ID="video"\nvideo.m3u8\n')
+        (fixture / "auto-steering.m3u8").write_text('#EXTM3U\n#EXT-X-CONTENT-STEERING:SERVER-URI="steering.json",PATHWAY-ID="failed"\n'
+            f'#EXT-X-STREAM-INF:{same_stream},PATHWAY-ID="failed"\n{bad_origin}/video.m3u8\n')
+        (fixture / "steering.json").write_text(json.dumps({"VERSION": 1, "TTL": 60, "PATHWAY-PRIORITY": ["mirror"],
+            "PATHWAY-CLONES": [{"BASE-ID": "failed", "ID": "mirror", "URI-REPLACEMENT": {"HOST": good_host}}]}))
         (fixture / "video").mkdir()
         for payload in [*fixture.glob("*.ts"), fixture / "enc.key"]:
             shutil.copyfile(payload, fixture / "video" / payload.name)

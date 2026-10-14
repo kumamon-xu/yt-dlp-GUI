@@ -37,6 +37,8 @@ pub struct GlobalSettings {
     pub use_m3u8dl: bool,
     #[serde(default = "default_use_m3u8dl")]
     pub hls_preflight: bool,
+    #[serde(default = "default_use_m3u8dl")]
+    pub hls_auto_discovery: bool,
     #[serde(default)]
     pub hls_mirrors: Vec<crate::hls_preflight::MirrorRule>,
     #[serde(default = "default_merge")]
@@ -79,6 +81,7 @@ impl Default for GlobalSettings {
             m3u8dl_path: None,
             use_m3u8dl: true,
             hls_preflight: true,
+            hls_auto_discovery: true,
             hls_mirrors: Vec::new(),
             merge_format: default_merge(),
         }
@@ -169,6 +172,7 @@ mod tests {
     fn legacy_settings_enable_checks_without_trusting_unknown_mirrors() {
         let s: GlobalSettings = serde_json::from_str("{}").unwrap();
         assert!(s.hls_preflight);
+        assert!(s.hls_auto_discovery);
         assert!(s.hls_mirrors.is_empty());
     }
 
